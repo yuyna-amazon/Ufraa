@@ -1,0 +1,1642 @@
+// ==UserScript==
+// @name         Ufraa
+// @namespace    https://github.com/yuyna-amazon/Ufraa
+// @version      3.0
+// @description  Ufraa Assignment Plan: Route Duration乖離表示 + SSDラベル + CSV出力 / Service AreasからSSD時間帯を一括巡回してCSV出力
+// @author       yuyna
+// @icon         https://www.google.com/s2/favicons?sz=64&domain=amazon.com
+// @match        https://viz-fe.ufraa.last-mile.amazon.dev/*
+// @updateURL    https://raw.githubusercontent.com/yuyna-amazon/Ufraa-Assignment-Plan/main/Ufraa%20Assignment%20Plan.js
+// @downloadURL  https://raw.githubusercontent.com/yuyna-amazon/Ufraa-Assignment-Plan/main/Ufraa%20Assignment%20Plan.js
+// @grant        none
+// @run-at       document-start
+// ==/UserScript==
+
+/*
+ * 構成
+ *   1. 共通定義 / ページ判定
+ *   2. 認証フック（document-start で fetch/XHR を差し替えて creds と midway token を捕捉）
+ *   3. SigV4署名 / artifact-metadata API
+ *   4. 共通ユーティリティ
+ *   5. Preferences（表示カラム）＋ Filter 入力
+ *   6. Live画面: Gap Check / SSDラベル / 行ハイライト
+ *   7. Live画面: ツールバーUI（SSD絞り込み・CSV出力・設定）
+ *   8. Batch: Assignment Planページの巡回収集
+ *   9. Batch: SPR集計と表示
+ *  10. Batch: 収集データの結合CSV出力
+ *  11. Batch: planner-input解決とバッチ実行
+ *  12. Batch: Service AreasページのパネルUI
+ *  13. 初期化
+ */
+
+(function () {
+    'use strict';
+
+    // ===========================================================
+    // 1. 共通定義 / ページ判定
+    // ===========================================================
+
+    const CHECK_INTERVAL_MS = 5000;
+    const TICK_INTERVAL_MS = 500;
+
+    // Block Start（分換算）→ SSDサイクル判定
+    const SSD_FILTERS = [
+        { label: 'SSD_1',   min: 0,    max: 360 },
+        { label: 'SSD_1_B', min: 360,  max: 540 },
+        { label: 'SSD_2',   min: 540,  max: 720 },
+        { label: 'SSD_3',   min: 720,  max: 960 },
+        { label: 'SSD_3_B', min: 960,  max: 1140 },
+        { label: 'SSD_4',   min: 1140, max: Infinity }
+    ];
+
+    // バッチ巡回で狙う planner-input の生成時刻 (JST)
+    const SSD_SCHEDULE = [
+        { label: 'SSD_1',   jstHour: 5,  jstMin: 55 },
+        { label: 'SSD_1_B', jstHour: 8,  jstMin: 55 },
+        { label: 'SSD_2',   jstHour: 11, jstMin: 55 },
+        { label: 'SSD_3',   jstHour: 15, jstMin: 55 },
+        { label: 'SSD_3_B', jstHour: 18, jstMin: 55 },
+        { label: 'SSD_4',   jstHour: 21, jstMin: 55 }
+    ];
+
+    // Preferencesで表示ONにするカラム（これ以外はOFF）／CSVに出力するカラム
+    const DESIRED_COLUMNS = [
+        'Route Name Prefix',
+        'Route Id Prefix',
+        'Route Duration',
+        'Route Package Count',
+        'Dispatch Start',
+        'Dispatch End',
+        'Assignment Status',
+        'Transporter Id',
+        'Ready To Work',
+        'Block Start',
+        'Block End',
+        'Block Length'
+    ];
+
+    // Live画面のFilter入力欄に自動入力する文字列
+    const FILTER_TEXT = 'Open,Waiting,Unknown';
+
+    // artifact-metadata API
+    const HOST = 'fulv8diza1.execute-api.us-west-2.amazonaws.com';
+    const REGION = 'us-west-2';
+    const SERVICE = 'execute-api';
+    const EMPTY_SHA256 = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
+    const INPUT_TYPE = 'FLEX_ROUTE_ASSIGNMENT_PLANNER_INPUT';
+
+    // localStorageキー
+    const LS_COLLECT = 'ufraaSsdCollected';
+    const LS_QUEUE = 'ufraaSsdWorkerQueue';
+
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const p2 = (n) => String(n).padStart(2, '0');
+
+    /** /service-areas/<uuid> ページならservice area IDを返す */
+    function serviceAreaId() {
+        const m = /\/service-areas\/([0-9a-f-]{36})/i.exec(location.pathname);
+        return m ? m[1] : null;
+    }
+
+    /** /assignment-plan/<artifactId> のartifactIdを返す（liveは除外） */
+    function artifactIdFromPath() {
+        const m = /^\/assignment-plan\/(.+)$/.exec(location.pathname);
+        if (!m) return null;
+        const id = decodeURIComponent(m[1]);
+        return id === 'live' || id.startsWith('live/') ? null : id;
+    }
+
+    /** Assignment Plan Live画面か */
+    function isLivePage() {
+        return /^\/assignment-plan\/live/.test(location.pathname);
+    }
+
+    // ===========================================================
+    // 2. 認証フック
+    //    document-start でアプリより先に fetch/XHR を包み、
+    //    cognitoレスポンスの一時credsと x-midway-token を捕捉する
+    // ===========================================================
+
+    const AUTH = { creds: null, midway: null };
+
+    function captureCreds(j) {
+        if (j && j.Credentials && j.Credentials.AccessKeyId) AUTH.creds = j.Credentials;
+    }
+
+    const origFetch = window.fetch;
+    window.fetch = function (input, init) {
+        try {
+            const url = typeof input === 'string' ? input : (input && input.url) || '';
+            // ヘッダーからmidwayトークンを探す（Headers / 配列 / プレーンobject に対応）
+            const h = (init && init.headers) || (typeof input === 'object' && input.headers);
+            if (h) {
+                let mid = null;
+                if (h instanceof Headers) {
+                    mid = h.get('x-midway-token');
+                } else if (Array.isArray(h)) {
+                    const found = h.find(([k]) => k.toLowerCase() === 'x-midway-token');
+                    if (found) mid = found[1];
+                } else if (typeof h === 'object') {
+                    for (const k of Object.keys(h)) {
+                        if (k.toLowerCase() === 'x-midway-token') { mid = h[k]; break; }
+                    }
+                }
+                if (mid) { AUTH.midway = mid; console.log('[Ufraa] midway token captured via fetch'); }
+            }
+            const p = origFetch.apply(this, arguments);
+            if (url.includes('cognito-identity')) {
+                p.then((res) => {
+                    res.clone().text().then((t) => {
+                        try { captureCreds(JSON.parse(t)); console.log('[Ufraa] creds captured via fetch'); } catch (e) {}
+                    }).catch(() => {});
+                }).catch(() => {});
+            }
+            return p;
+        } catch (e) {
+            return origFetch.apply(this, arguments);
+        }
+    };
+
+    const oOpen = XMLHttpRequest.prototype.open;
+    const oSend = XMLHttpRequest.prototype.send;
+    const oSet = XMLHttpRequest.prototype.setRequestHeader;
+
+    XMLHttpRequest.prototype.open = function (m, u) {
+        this.__u = u;
+        return oOpen.apply(this, arguments);
+    };
+    XMLHttpRequest.prototype.setRequestHeader = function (k, v) {
+        if (k && k.toLowerCase() === 'x-midway-token') {
+            AUTH.midway = v;
+            console.log('[Ufraa] midway token captured via XHR header');
+        }
+        return oSet.apply(this, arguments);
+    };
+    XMLHttpRequest.prototype.send = function () {
+        this.addEventListener('load', () => {
+            try {
+                if (!this.__u) return;
+                if (!String(this.__u).includes('cognito-identity')) return;
+                const rt = this.responseType;
+                let obj = null;
+                if (rt === 'json') obj = this.response;
+                else if (rt === '' || rt === 'text') obj = JSON.parse(this.responseText);
+                else if (rt === 'arraybuffer' && this.response) obj = JSON.parse(new TextDecoder().decode(this.response));
+                if (obj) { captureCreds(obj); console.log('[Ufraa] creds captured via XHR'); }
+            } catch (e) {}
+        });
+        return oSend.apply(this, arguments);
+    };
+
+    // ===========================================================
+    // 3. SigV4署名 / artifact-metadata API
+    // ===========================================================
+
+    const enc = new TextEncoder();
+    const toHex = (buf) => [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
+
+    async function sha256Hex(str) {
+        return toHex(await crypto.subtle.digest('SHA-256', enc.encode(str)));
+    }
+
+    async function hmac(keyBuf, msg) {
+        const key = await crypto.subtle.importKey('raw', keyBuf, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+        return crypto.subtle.sign('HMAC', key, enc.encode(msg));
+    }
+
+    function awsEncode(str) {
+        return encodeURIComponent(str).replace(/[!'()*]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+    }
+
+    function canonicalQuery(params) {
+        return Object.keys(params).sort().map((k) => `${awsEncode(k)}=${awsEncode(params[k])}`).join('&');
+    }
+
+    async function signedGet(pathOnly, query) {
+        if (!AUTH.creds || !AUTH.midway) throw new Error('認証情報が未取得です。ページを一度リロードしてください。');
+        const { AccessKeyId, SecretKey, SessionToken } = AUTH.creds;
+        const amzDate = new Date().toISOString().replace(/[:-]|\.\d{3}/g, '');
+        const dateStamp = amzDate.slice(0, 8);
+        const qs = query ? canonicalQuery(query) : '';
+        const canonicalHeaders =
+            `host:${HOST}\nx-amz-date:${amzDate}\nx-amz-security-token:${SessionToken}\nx-midway-token:${AUTH.midway}\n`;
+        const signedHeaders = 'host;x-amz-date;x-amz-security-token;x-midway-token';
+        const canonicalRequest = `GET\n${pathOnly}\n${qs}\n${canonicalHeaders}\n${signedHeaders}\n${EMPTY_SHA256}`;
+        const scope = `${dateStamp}/${REGION}/${SERVICE}/aws4_request`;
+        const stringToSign = `AWS4-HMAC-SHA256\n${amzDate}\n${scope}\n${await sha256Hex(canonicalRequest)}`;
+        const kDate = await hmac(enc.encode('AWS4' + SecretKey), dateStamp);
+        const kRegion = await hmac(kDate, REGION);
+        const kService = await hmac(kRegion, SERVICE);
+        const kSigning = await hmac(kService, 'aws4_request');
+        const signature = toHex(await hmac(kSigning, stringToSign));
+        const authorization =
+            `AWS4-HMAC-SHA256 Credential=${AccessKeyId}/${scope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
+        const headers = {
+            Authorization: authorization,
+            'X-Amz-Date': amzDate,
+            'X-Amz-Security-Token': SessionToken,
+            'x-midway-token': AUTH.midway
+        };
+        const url = `https://${HOST}${pathOnly}` + (qs ? `?${qs}` : '');
+        return origFetch(url, { method: 'GET', mode: 'cors', credentials: 'omit', headers });
+    }
+
+    async function gunzipText(res) {
+        const buf = new Uint8Array(await res.arrayBuffer());
+        if (buf.length > 2 && buf[0] === 0x1f && buf[1] === 0x8b) {
+            return new Response(new Blob([buf]).stream().pipeThrough(new DecompressionStream('gzip'))).text();
+        }
+        return new TextDecoder().decode(buf);
+    }
+
+    async function apiGetJson(pathOnly, query, tries = 3) {
+        for (let i = 0; i < tries; i++) {
+            const res = await signedGet(pathOnly, query);
+            if (res.ok) {
+                try { return JSON.parse(await gunzipText(res)); } catch (e) { return null; }
+            }
+            if ([401, 403, 429, 500, 502, 503].includes(res.status) && i < tries - 1) {
+                await sleep(2000);
+                continue;
+            }
+            return null;
+        }
+        return null;
+    }
+
+    /** 1時間刻みでartifact-metadataを取得して重複排除 */
+    async function fetchInputMeta(sa, startSec, endSec) {
+        let all = [];
+        for (let t = startSec; t < endSec; t += 3600) {
+            const to = Math.min(t + 3600, endSec);
+            const j = await apiGetJson('/prod/artifact-metadata', {
+                scope: sa,
+                artifactType: INPUT_TYPE,
+                startTime: String(t),
+                endTime: String(to)
+            });
+            if (j && j.artifactMetadataList) all = all.concat(j.artifactMetadataList);
+        }
+        const seen = new Set();
+        const list = [];
+        for (const a of all) {
+            if (!seen.has(a.artifactId)) { seen.add(a.artifactId); list.push(a); }
+        }
+        list.sort((a, b) => (a.creationTime < b.creationTime ? -1 : 1));
+        return list;
+    }
+
+    // ===========================================================
+    // 4. 共通ユーティリティ
+    // ===========================================================
+
+    function loadJson(key) {
+        try { return JSON.parse(localStorage.getItem(key) || 'null'); } catch (e) { return null; }
+    }
+
+    function todayJst() {
+        const d = new Date(Date.now() + 9 * 3600 * 1000);
+        return `${d.getUTCFullYear()}-${p2(d.getUTCMonth() + 1)}-${p2(d.getUTCDate())}`;
+    }
+
+    function stampNow() {
+        const d = new Date(Date.now() + 9 * 3600 * 1000);
+        return `${d.getUTCFullYear()}${p2(d.getUTCMonth() + 1)}${p2(d.getUTCDate())}_` +
+               `${p2(d.getUTCHours())}${p2(d.getUTCMinutes())}${p2(d.getUTCSeconds())}`;
+    }
+
+    /** artifactIdのパス (/YYYY/MM/DD/HH/mm/) からJSTの日付と時刻を復元 */
+    function jstFromArtifactId(id) {
+        const m = /\/(\d{4})\/(\d{2})\/(\d{2})\/(\d{2})\/(\d{2})\//.exec(id || '');
+        if (!m) return { date: '', time: '' };
+        const ms = Date.parse(`${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:00Z`);
+        const d = new Date(ms + 9 * 3600 * 1000);
+        return {
+            date: `${d.getUTCFullYear()}-${p2(d.getUTCMonth() + 1)}-${p2(d.getUTCDate())}`,
+            time: `${p2(d.getUTCHours())}:${p2(d.getUTCMinutes())}`
+        };
+    }
+
+    /** SSD_SCHEDULEの中で最も近い時刻のラベルを返す（±30分以内） */
+    function ssdLabelFromJstTime(timeStr) {
+        if (!timeStr) return 'Unknown';
+        const [h, m] = timeStr.split(':').map(Number);
+        const minutes = h * 60 + m;
+        let best = null;
+        let bestDiff = Infinity;
+        for (const ssd of SSD_SCHEDULE) {
+            const diff = Math.abs(minutes - (ssd.jstHour * 60 + ssd.jstMin));
+            if (diff < bestDiff) { bestDiff = diff; best = ssd; }
+        }
+        return best && bestDiff <= 30 ? best.label : 'Unknown';
+    }
+
+    /** "2026-08-07 05:40:00 JST" / "5:40" / "05:40:00" → 0:00からの分数 */
+    function parseTimeOfDayToMinutes(timeStr) {
+        if (!timeStr || typeof timeStr !== 'string') return null;
+        const match = timeStr.trim().match(/(\d{1,2}):(\d{2})(?::(\d{2}))?/);
+        if (!match) return null;
+        return parseInt(match[1]) * 60 + parseInt(match[2]);
+    }
+
+    /** 分数からSSD_FILTERSのラベルを判定 */
+    function getSSDLabel(minutes) {
+        if (minutes === null) return null;
+        for (const filter of SSD_FILTERS) {
+            if (minutes >= filter.min && minutes < filter.max) return filter.label;
+        }
+        return null;
+    }
+
+    /** Route Duration / Block Length などの所要時間文字列を分数に変換 */
+    function parseDurationToMinutes(timeStr) {
+        if (!timeStr || typeof timeStr !== 'string') return null;
+        timeStr = timeStr.trim();
+
+        // 値なし（"-", "–", "N/A" 等）は計算対象外
+        if (/^(?:[-–—]+|n\/a|na|null)$/i.test(timeStr)) return null;
+
+        // "Xh Ym Zs" or "Xh Ymin"
+        let match = timeStr.match(/^(\d+)\s*h(?:r|rs|ours?)?\s*(\d+)\s*m(?:in|ins|inutes?)?/i);
+        if (match) return parseInt(match[1]) * 60 + parseInt(match[2]);
+
+        // "Xh Zs"（時間と秒のみ、分なし）
+        match = timeStr.match(/^(\d+)\s*h(?:r|rs|ours?)?\s*(\d+)\s*s(?:ec|ecs|econds?)?/i);
+        if (match) return parseInt(match[1]) * 60;
+
+        // "Xh" のみ
+        match = timeStr.match(/^(\d+)\s*h(?:r|rs|ours?)?$/i);
+        if (match) return parseInt(match[1]) * 60;
+
+        // "Ym Zs" or "Ym"
+        match = timeStr.match(/^(\d+)\s*m(?:in|ins|inutes?)?/i);
+        if (match) return parseInt(match[1]);
+
+        // "H:MM:SS" or "H:MM"
+        match = timeStr.match(/^(\d+):(\d+)(?::(\d+))?$/);
+        if (match) return parseInt(match[1]) * 60 + parseInt(match[2]);
+
+        // 数字のみ（分として扱う）
+        match = timeStr.match(/^(\d+(?:\.\d+)?)$/);
+        if (match) return parseFloat(match[1]);
+
+        return null;
+    }
+
+    /** 差分を "+1h 20m" 形式に整形 */
+    function minutesToDisplay(minutes) {
+        if (minutes === null || minutes === undefined) return 'N/A';
+        if (minutes === 0) return '0m';
+        const h = Math.floor(Math.abs(minutes) / 60);
+        const m = Math.round(Math.abs(minutes) % 60);
+        const sign = minutes < 0 ? '-' : '+';
+        if (h > 0) return `${sign}${h}h ${m}m`;
+        return `${sign}${m}m`;
+    }
+
+    // --- CSV ---
+
+    /** 画面テーブルそのまま出力用（改行・空白を保持） */
+    function escapeCSV(text) {
+        if (!text) return '';
+        if (text.includes(',') || text.includes('"') || text.includes('\n')) {
+            return '"' + text.replace(/"/g, '""') + '"';
+        }
+        return text;
+    }
+
+    /** バッチ収集データ用（連続空白を1つに畳む） */
+    const csvEsc = (v) => {
+        const s = v == null ? '' : String(v).replace(/\s+/g, ' ').trim();
+        return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+    };
+
+    function arrToCsv(headers, rows) {
+        const lines = [];
+        if (headers && headers.length) lines.push(headers.map(csvEsc).join(','));
+        for (const r of rows) lines.push(r.map(csvEsc).join(','));
+        return '\uFEFF' + lines.join('\r\n');
+    }
+
+    function downloadText(text, fileName) {
+        const url = URL.createObjectURL(new Blob([text], { type: 'text/csv;charset=utf-8' }));
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = fileName;
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(() => { a.remove(); URL.revokeObjectURL(url); }, 1000);
+    }
+
+    // ===========================================================
+    // 5. Preferences（表示カラム）＋ Filter 入力
+    //    Live画面の「設定」ボタンとバッチ巡回の初回ページで共用する
+    // ===========================================================
+
+    function findPreferencesButton() {
+        return (
+            document.querySelector('button[aria-label="Preferences"]') ||
+            document.querySelector('button[title="Preferences"]') ||
+            document.querySelector('[class*="awsui_tools-preferences"] button')
+        );
+    }
+
+    /** Preferencesダイアログを開いてDESIRED_COLUMNSのみ表示ONにする */
+    async function configurePreferences() {
+        const prefBtn = findPreferencesButton();
+        if (!prefBtn) {
+            console.warn('[Ufraa] Preferencesボタンが見つかりません');
+            return { ok: false, message: '歯車ボタンが見つかりません' };
+        }
+
+        prefBtn.click();
+        await sleep(800);
+
+        // カラムオプション（label + toggle が兄弟要素になっている構造）
+        const options = document.querySelectorAll('[class*="visible-content-option_"]');
+        if (!options.length) {
+            console.warn('[Ufraa] Preferencesのカラム一覧が見つかりません');
+            return { ok: false, message: 'カラム一覧が見つかりません' };
+        }
+
+        let changed = 0;
+        for (const opt of options) {
+            const label = opt.querySelector('label');
+            const checkbox = opt.querySelector('input[type="checkbox"]');
+            if (!label || !checkbox) continue;
+
+            const text = label.textContent.trim();
+            const shouldBeChecked = DESIRED_COLUMNS.some((col) => text.toLowerCase() === col.toLowerCase());
+
+            if (shouldBeChecked !== checkbox.checked) {
+                // ラベルクリックでトグル（Reactのイベントが確実に発火する）
+                label.click();
+                changed++;
+                await sleep(60);
+            }
+        }
+
+        await sleep(300);
+
+        // Confirmボタンを押す（ダイアログ/ドロップダウン内のprimaryボタン）
+        const container =
+            options[0].closest('[class*="modal"], [role="dialog"], [class*="dropdown-content_"]') || document;
+        let confirmBtn = null;
+        container.querySelectorAll('button').forEach((b) => {
+            const t = (b.textContent || '').trim().toLowerCase();
+            if (!confirmBtn && (t === 'confirm' || t === 'ok' || t === 'apply')) confirmBtn = b;
+        });
+        if (!confirmBtn) confirmBtn = container.querySelector('button[class*="variant-primary"]');
+
+        if (confirmBtn) {
+            confirmBtn.click();
+            await sleep(500);
+        }
+
+        console.log(`[Ufraa] Preferences設定完了 (${changed}件変更)`);
+        return { ok: true, changed };
+    }
+
+    function findFilterInput() {
+        return (
+            document.querySelector('input[placeholder="Filter"]') ||
+            document.querySelector('input[type="search"][class*="awsui_input"]') ||
+            document.querySelector('[class*="tools-filtering"] input')
+        );
+    }
+
+    /**
+     * React管理下のinputに値を反映させる
+     * value直接代入ではReactのstateが更新されないため、
+     * ネイティブsetterを使ってからinputイベントを発火させる
+     */
+    function setReactInputValue(input, value) {
+        const descriptor = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+        if (descriptor && descriptor.set) {
+            descriptor.set.call(input, value);
+        } else {
+            input.value = value;
+        }
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+
+    async function applyStatusFilter() {
+        const input = findFilterInput();
+        if (!input) {
+            console.warn('[Ufraa] Filter入力欄が見つかりません');
+            return { ok: false, message: 'Filter入力欄が見つかりません' };
+        }
+
+        try {
+            input.focus({ preventScroll: true });
+        } catch (e) {
+            /* focus不可なら無視 */
+        }
+
+        setReactInputValue(input, FILTER_TEXT);
+        await sleep(400);
+
+        const applied = input.value === FILTER_TEXT;
+        console.log(`[Ufraa] Filter入力 ${applied ? '成功' : '失敗'}: "${input.value}"`);
+        return applied ? { ok: true } : { ok: false, message: 'Filterに値が反映されませんでした' };
+    }
+
+    // ===========================================================
+    // 6. Live画面: Gap Check / SSDラベル / 行ハイライト
+    // ===========================================================
+
+    // 選択中のSSD（ツールバーのドロップダウン）
+    let selectedSSD = 'ALL';
+
+    // スクリプトが追加したラベル類（クラス名）
+    const INJECTED_SELECTOR = '.ufraa-gap-label, .ufraa-ssd-label';
+
+    // 行ハイライト用クラス
+    const HIGHLIGHT_CLASS = 'ufraa-highlight-row';
+
+    /**
+     * ハイライト用のCSSを一度だけ挿入する
+     * Cloudscapeのtdが背景色を持つため、td側を !important で上書きする
+     */
+    function injectHighlightStyle() {
+        if (!document.head) return;
+        if (document.getElementById('ufraa-highlight-style')) return;
+        const style = document.createElement('style');
+        style.id = 'ufraa-highlight-style';
+        style.textContent = `
+            tr.${HIGHLIGHT_CLASS} > td {
+                background-color: #fff3b0 !important;
+            }
+            tr.${HIGHLIGHT_CLASS} > td:first-child {
+                box-shadow: inset 4px 0 0 #e8a400;
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    /** スクリプトが追加したラベルを全て除去する（計算前に必ず呼ぶ） */
+    function clearInjectedLabels() {
+        document.querySelectorAll(INJECTED_SELECTOR).forEach((el) => el.remove());
+    }
+
+    /** セルの元テキストを取得（スクリプト追加分を除外） */
+    function getCellText(cell) {
+        if (!cell) return null;
+        if (!cell.querySelector(INJECTED_SELECTOR)) {
+            return cell.textContent.trim();
+        }
+        const clone = cell.cloneNode(true);
+        clone.querySelectorAll(INJECTED_SELECTOR).forEach((el) => el.remove());
+        return clone.textContent.trim();
+    }
+
+    function findColumnIndices(table) {
+        const headers = table.querySelectorAll('th, thead td');
+        let routeDurationIdx = -1;
+        let blockLengthIdx = -1;
+        let routeNameIdx = -1;
+        let blockStartIdx = -1;
+        let readyToWorkIdx = -1;
+        let assignmentStatusIdx = -1;
+
+        headers.forEach((header, index) => {
+            const text = header.textContent.trim().toLowerCase();
+            if (text.includes('route duration') || text.includes('routeduration')) {
+                routeDurationIdx = index;
+            }
+            if (text.includes('block length') || text.includes('blocklength') || text.includes('block len')) {
+                blockLengthIdx = index;
+            }
+            if (text.includes('route') && text.includes('name') && !text.includes('duration')) {
+                routeNameIdx = index;
+            }
+            if (routeNameIdx === -1 && text.includes('route') && text.includes('id')) {
+                routeNameIdx = index;
+            }
+            if (text.includes('block start') || text.includes('blockstart')) {
+                blockStartIdx = index;
+            }
+            if (text.includes('ready to work') || text.includes('readytowork')) {
+                readyToWorkIdx = index;
+            }
+            if (text.includes('assignment status') || text.includes('assignmentstatus')) {
+                assignmentStatusIdx = index;
+            }
+        });
+
+        return {
+            routeDurationIdx,
+            blockLengthIdx,
+            routeNameIdx,
+            blockStartIdx,
+            readyToWorkIdx,
+            assignmentStatusIdx
+        };
+    }
+
+    function extractData() {
+        const results = [];
+        const tables = document.querySelectorAll('table');
+
+        for (const table of tables) {
+            const {
+                routeDurationIdx,
+                blockLengthIdx,
+                routeNameIdx,
+                blockStartIdx,
+                readyToWorkIdx,
+                assignmentStatusIdx
+            } = findColumnIndices(table);
+            if (routeDurationIdx === -1 || blockLengthIdx === -1) continue;
+
+            const rows = table.querySelectorAll('tbody tr, tr:not(:first-child)');
+            rows.forEach((row) => {
+                const cells = row.querySelectorAll('td');
+                if (cells.length <= Math.max(routeDurationIdx, blockLengthIdx)) return;
+
+                const routeDurationText = getCellText(cells[routeDurationIdx]);
+                const blockLengthText = getCellText(cells[blockLengthIdx]);
+                const blockStartText = blockStartIdx >= 0 ? getCellText(cells[blockStartIdx]) : null;
+                const readyToWorkText = readyToWorkIdx >= 0 ? getCellText(cells[readyToWorkIdx]) : null;
+                const assignmentStatusText =
+                    assignmentStatusIdx >= 0 ? getCellText(cells[assignmentStatusIdx]) : null;
+
+                const routeDuration = parseDurationToMinutes(routeDurationText);
+                const blockLength = parseDurationToMinutes(blockLengthText);
+
+                const hasDuration = routeDuration !== null && blockLength !== null;
+                const hasBlockStart = blockStartText && parseTimeOfDayToMinutes(blockStartText) !== null;
+                const hasHighlightData = readyToWorkText !== null && assignmentStatusText !== null;
+
+                if (hasDuration || hasBlockStart || hasHighlightData) {
+                    results.push({
+                        difference: hasDuration ? routeDuration - blockLength : null,
+                        row,
+                        routeNameCell: routeNameIdx >= 0 ? cells[routeNameIdx] : null,
+                        routeDurationCell: cells[routeDurationIdx] || null,
+                        blockStartCell: blockStartIdx >= 0 ? cells[blockStartIdx] : null,
+                        blockStartText,
+                        readyToWorkText,
+                        assignmentStatusText
+                    });
+                }
+            });
+        }
+
+        return results;
+    }
+
+    /** Ready To Work が 👍 かつ Assignment Status が Waiting の行かどうか */
+    function shouldHighlightRow(item) {
+        if (!item.readyToWorkText || !item.assignmentStatusText) return false;
+        const readyOk = item.readyToWorkText.includes('👍');
+        const waiting = item.assignmentStatusText.trim().toLowerCase() === 'waiting';
+        return readyOk && waiting;
+    }
+
+    /** 行ハイライトを全解除する（行が再利用されるため毎回リセットが必要） */
+    function clearHighlights() {
+        document
+            .querySelectorAll(`tr.${HIGHLIGHT_CLASS}`)
+            .forEach((row) => row.classList.remove(HIGHLIGHT_CLASS));
+    }
+
+    function displayGaps(results) {
+        results.forEach((item) => {
+            // Ready To Work 👍 かつ Waiting の行をハイライト
+            if (shouldHighlightRow(item)) {
+                item.row.classList.add(HIGHLIGHT_CLASS);
+            }
+
+            // SSDラベルを判定
+            let ssdLabel = null;
+            if (item.blockStartText) {
+                const blockStartMinutes = parseTimeOfDayToMinutes(item.blockStartText);
+                ssdLabel = getSSDLabel(blockStartMinutes);
+            }
+
+            // 選択したSSDに該当する行のSSDラベルを赤文字に
+            if (selectedSSD !== 'ALL' && ssdLabel === selectedSSD) {
+                item._highlightSSD = true;
+            }
+
+            // Gap表示（Route Durationセルの横）
+            if (item.difference !== null && item.routeDurationCell) {
+                const bodyCell = item.routeDurationCell.querySelector('[class*="awsui_body-cell-content"]');
+                const container = bodyCell || item.routeDurationCell;
+
+                container.style.display = 'flex';
+                container.style.alignItems = 'center';
+
+                const gapSpan = document.createElement('span');
+                gapSpan.className = 'ufraa-gap-label';
+                const color = item.difference < 0 ? '#d32f2f' : item.difference > 0 ? '#388e3c' : '#333';
+                gapSpan.style.cssText = `color:${color};font-weight:bold;margin-left:16px;font-size:12px;white-space:nowrap;`;
+                gapSpan.textContent = minutesToDisplay(item.difference);
+                container.appendChild(gapSpan);
+            }
+
+            // SSDラベル表示（Block Startセルの横）
+            if (item.blockStartCell && item.blockStartText && ssdLabel) {
+                const bsBodyCell = item.blockStartCell.querySelector('[class*="awsui_body-cell-content"]');
+                const bsContainer = bsBodyCell || item.blockStartCell;
+
+                bsContainer.style.display = 'flex';
+                bsContainer.style.alignItems = 'center';
+
+                const ssdSpan = document.createElement('span');
+                ssdSpan.className = 'ufraa-ssd-label';
+                const ssdColor = item._highlightSSD ? '#d32f2f' : '#0073bb';
+                ssdSpan.style.cssText = `color:${ssdColor};font-weight:bold;margin-left:12px;font-size:11px;white-space:nowrap;`;
+                ssdSpan.textContent = ssdLabel;
+                bsContainer.appendChild(ssdSpan);
+            }
+        });
+    }
+
+    /**
+     * Live画面のみで実行する
+     * 巡回対象のAssignment Planページでラベルを差し込むと
+     * scrapeTable()が読むinnerTextが汚染されるため、必ずページ判定で守る
+     */
+    function runGapCheck() {
+        if (!isLivePage() || !document.body) return;
+
+        injectHighlightStyle();
+
+        // 前回のラベルとハイライトを先に全消去してから計算する（残留値の再計算を防ぐ）
+        clearInjectedLabels();
+        clearHighlights();
+
+        const results = extractData();
+        displayGaps(results);
+    }
+
+    // ===========================================================
+    // 7. Live画面: ツールバーUI（SSD絞り込み・CSV出力・設定）
+    // ===========================================================
+
+    /** ツールバー右側のコンテナ（歯車の手前に挿入する） */
+    function toolbarAlignRight() {
+        return document.querySelector('[class*="awsui_tools-align-right"]');
+    }
+
+    function insertBeforePrefs(alignRight, el) {
+        alignRight.style.display = 'flex';
+        alignRight.style.alignItems = 'center';
+        const prefs = alignRight.querySelector('[class*="awsui_tools-preferences"]');
+        if (prefs) {
+            alignRight.insertBefore(el, prefs);
+        } else {
+            alignRight.appendChild(el);
+        }
+    }
+
+    function createSSDDropdown() {
+        if (document.getElementById('ssd-filter-select')) return;
+        const alignRight = toolbarAlignRight();
+        if (!alignRight) return;
+
+        const select = document.createElement('select');
+        select.id = 'ssd-filter-select';
+        select.style.cssText = `
+            padding: 4px 8px;
+            border: 1px solid #aaa;
+            border-radius: 4px;
+            font-size: 13px;
+            font-weight: bold;
+            height: 32px;
+            margin-right: 8px;
+            cursor: pointer;
+        `;
+
+        const allOption = document.createElement('option');
+        allOption.value = 'ALL';
+        allOption.textContent = 'SSD: 全て';
+        select.appendChild(allOption);
+
+        SSD_FILTERS.forEach((f) => {
+            const option = document.createElement('option');
+            option.value = f.label;
+            option.textContent = f.label;
+            select.appendChild(option);
+        });
+
+        select.value = selectedSSD;
+        select.addEventListener('change', () => {
+            selectedSSD = select.value;
+            runGapCheck();
+        });
+
+        insertBeforePrefs(alignRight, select);
+    }
+
+    function createCSVButton() {
+        if (document.getElementById('csv-export-btn')) return;
+        const alignRight = toolbarAlignRight();
+        if (!alignRight) return;
+
+        const downloadBtn = document.createElement('button');
+        downloadBtn.id = 'csv-export-btn';
+        downloadBtn.textContent = 'CSV出力';
+        downloadBtn.style.cssText = `
+            padding: 6px 12px;
+            background-color: #0073bb;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: bold;
+            height: 32px;
+            margin-right: 8px;
+        `;
+        downloadBtn.addEventListener('click', downloadCSV);
+        downloadBtn.addEventListener('mouseover', () => (downloadBtn.style.backgroundColor = '#005a8c'));
+        downloadBtn.addEventListener('mouseout', () => (downloadBtn.style.backgroundColor = '#0073bb'));
+
+        insertBeforePrefs(alignRight, downloadBtn);
+    }
+
+    function createPrefsButton() {
+        if (document.getElementById('ufraa-prefs-btn')) return;
+        const alignRight = toolbarAlignRight();
+        if (!alignRight) return;
+
+        const btn = document.createElement('button');
+        btn.id = 'ufraa-prefs-btn';
+        btn.textContent = '設定';
+        btn.title = `表示カラムを設定し、Filterに "${FILTER_TEXT}" を入力します`;
+        btn.style.cssText = `
+            padding: 6px 12px;
+            background-color: #7a1fa2;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: bold;
+            height: 32px;
+            margin-right: 8px;
+        `;
+        btn.addEventListener('mouseover', () => {
+            if (!btn.disabled) btn.style.backgroundColor = '#5c1780';
+        });
+        btn.addEventListener('mouseout', () => {
+            if (!btn.disabled) btn.style.backgroundColor = '#7a1fa2';
+        });
+
+        btn.addEventListener('click', async () => {
+            btn.disabled = true;
+            btn.style.opacity = '0.6';
+            btn.textContent = '設定中...';
+            try {
+                const prefsResult = await configurePreferences();
+                await sleep(600);
+                const filterResult = await applyStatusFilter();
+
+                const errors = [];
+                if (!prefsResult.ok) errors.push(`カラム設定: ${prefsResult.message}`);
+                if (!filterResult.ok) errors.push(`Filter入力: ${filterResult.message}`);
+
+                btn.textContent = errors.length === 0 ? '設定完了' : '設定失敗';
+                if (errors.length > 0) alert(`設定に失敗しました\n${errors.join('\n')}`);
+
+                // 再描画後にラベルとハイライトを再適用
+                await sleep(1200);
+                runGapCheck();
+            } catch (e) {
+                console.error('[Ufraa] 設定エラー:', e);
+                btn.textContent = '設定失敗';
+                alert(`設定でエラーが発生しました: ${e.message}`);
+            } finally {
+                await sleep(1500);
+                btn.disabled = false;
+                btn.style.opacity = '1';
+                btn.style.backgroundColor = '#7a1fa2';
+                btn.textContent = '設定';
+            }
+        });
+
+        insertBeforePrefs(alignRight, btn);
+    }
+
+    /** Live画面のUIが欠けていたら作り直す */
+    function ensureLiveUi() {
+        createSSDDropdown();
+        createCSVButton();
+        createPrefsButton();
+    }
+
+    /** 表示中のテーブルをそのままCSVに落とす（スクリプト追加ラベルは除外） */
+    function downloadCSV() {
+        const rows = [];
+
+        // ヘッダーを取得
+        const headerCells = document.querySelectorAll('[class*="header-cell_"]');
+        if (headerCells.length > 0) {
+            const headerRow = [];
+            headerCells.forEach((cell) => {
+                const text = cell.textContent.trim();
+                if (text) headerRow.push(escapeCSV(text));
+            });
+            if (headerRow.length > 0) rows.push(headerRow.join(','));
+        }
+
+        // ボディを取得（スクリプトで追加した要素を除外）
+        const allBodyCells = document.querySelectorAll('td[class*="body-cell_"]');
+        if (allBodyCells.length > 0) {
+            const rowMap = new Map();
+            allBodyCells.forEach((cell) => {
+                const row = cell.closest('tr');
+                if (row) {
+                    if (!rowMap.has(row)) rowMap.set(row, []);
+                    // セルをクローンしてスクリプト追加要素を除去
+                    const clone = cell.cloneNode(true);
+                    clone.querySelectorAll(INJECTED_SELECTOR).forEach((el) => el.remove());
+                    rowMap.get(row).push(escapeCSV(clone.textContent.trim()));
+                }
+            });
+            rowMap.forEach((cellData) => {
+                if (cellData.length > 0) rows.push(cellData.join(','));
+            });
+        }
+
+        if (rows.length === 0) {
+            alert('データが見つかりません。');
+            return;
+        }
+
+        const now = new Date();
+        const timestamp = now.toISOString().slice(0, 19).replace(/[:-]/g, '');
+        downloadText('\uFEFF' + rows.join('\n'), `assignment_plan_${timestamp}.csv`);
+    }
+
+    // ===========================================================
+    // 8. Batch: Assignment Planページの巡回収集
+    // ===========================================================
+
+    function readCollect() { return loadJson(LS_COLLECT) || {}; }
+    function writeCollect(o) { try { localStorage.setItem(LS_COLLECT, JSON.stringify(o)); } catch (e) {} }
+
+    /** AWS UIのheader-cell/body-cellクラスからテーブルを読み取る */
+    function scrapeTable() {
+        const headers = [];
+        document.querySelectorAll('[class*="header-cell_"]').forEach((cell) => {
+            const text = (cell.innerText || cell.textContent || '').trim();
+            if (text) headers.push(text);
+        });
+
+        const allBodyCells = document.querySelectorAll('td[class*="body-cell_"]');
+        if (!allBodyCells.length) return null;
+
+        const rowMap = new Map();
+        allBodyCells.forEach((cell) => {
+            const row = cell.closest('tr');
+            if (!row) return;
+            if (!rowMap.has(row)) rowMap.set(row, []);
+            // 選択チェックボックスセルはスキップ
+            if (cell.querySelector('input[type="checkbox"]')) return;
+            rowMap.get(row).push((cell.innerText || cell.textContent || '').trim());
+        });
+
+        const rows = [];
+        rowMap.forEach((cellData) => { if (cellData.length > 0) rows.push(cellData); });
+        if (!rows.length) return null;
+
+        // ヘッダーの余剰分を切る（行の列数に合わせる）
+        const n = rows[0].length;
+        let finalHeaders = headers;
+        if (n && headers.length > n) finalHeaders = headers.slice(0, n);
+
+        return { headers: finalHeaders, rows, count: rows.length };
+    }
+
+    function showBadge(text, color) {
+        if (!document.body) return;
+        let b = document.getElementById('ufraa-ssd-badge');
+        if (!b) {
+            b = document.createElement('div');
+            b.id = 'ufraa-ssd-badge';
+            b.style.cssText =
+                'position:fixed;left:16px;bottom:16px;z-index:2147483647;font:bold 12px sans-serif;' +
+                'color:#fff;padding:6px 10px;border-radius:6px;box-shadow:0 2px 8px rgba(0,0,0,.3)';
+            document.body.appendChild(b);
+        }
+        b.style.background = color;
+        b.textContent = text;
+    }
+
+    // 巡回状態
+    let _wId = null;
+    let _wCount = -1;
+    let _wStable = 0;
+    let _wAdv = false;
+    let _wStart = 0;
+    let _prefsRunning = false; // カラム設定処理の実行中フラグ
+
+    function collectAssignmentPage() {
+        const id = artifactIdFromPath();
+        if (!id) return;
+
+        // キューが存在し巡回中の場合のみ処理
+        const q = loadJson(LS_QUEUE);
+        if (!q || !q.active) return;
+
+        // 最初のページでカラム設定を自動適用（設定は保持されるので1回だけ）
+        if (!q.prefsApplied) {
+            if (_prefsRunning) return;
+            _prefsRunning = true;
+
+            showBadge('⚙ Preferences設定を適用中...', '#7a1fa2');
+
+            // テーブルが描画されるまで待つ
+            let waited = 0;
+            const waitTable = setInterval(async () => {
+                waited += 500;
+                const hasTable = !!document.querySelector('td[class*="body-cell_"]');
+                if (!hasTable && waited <= 20000) return;
+
+                clearInterval(waitTable);
+                try { await configurePreferences(); } catch (e) { console.warn('[Ufraa] prefs error:', e); }
+
+                // フラグを立てて以降はスキップ
+                const cur = loadJson(LS_QUEUE);
+                if (cur) {
+                    cur.prefsApplied = true;
+                    localStorage.setItem(LS_QUEUE, JSON.stringify(cur));
+                }
+
+                // テーブル再描画を待ってから収集開始
+                await sleep(2000);
+                _prefsRunning = false;
+                _wId = null;
+                _wCount = -1;
+                _wStable = 0;
+                _wStart = Date.now();
+                showBadge('⚙ Preferences設定完了 → データ収集開始', '#1f7a3d');
+            }, 500);
+            return;
+        }
+
+        if (_prefsRunning) return;
+
+        doCollect(id);
+    }
+
+    function doCollect(id) {
+        const jt = jstFromArtifactId(id);
+        const ssdLabel = ssdLabelFromJstTime(jt.time);
+        const t = scrapeTable();
+        const cnt = t ? t.count : 0;
+
+        if (cnt) {
+            const store = readCollect();
+            if (!store[id] || store[id].count !== cnt) {
+                store[id] = {
+                    date: jt.date,
+                    time: jt.time,
+                    ssd: ssdLabel,
+                    headers: t.headers,
+                    rows: t.rows,
+                    count: cnt,
+                    ts: Date.now()
+                };
+                writeCollect(store);
+            }
+            showBadge(`🗂 収集済: ${ssdLabel} ${jt.time} / ${cnt}行`, '#1f7a3d');
+        } else {
+            showBadge(`🗂 表を読込中... ${ssdLabel} ${jt.time}`, '#8a6d00');
+        }
+
+        // 巡回制御
+        if (_wAdv) return;
+
+        if (id !== _wId) { _wId = id; _wCount = -1; _wStable = 0; _wStart = Date.now(); }
+
+        // 行数が安定し、かつ行のカラム数が十分あることを確認
+        const colCount = t && t.rows.length > 0 ? t.rows[0].length : 0;
+        const stableCheck = cnt > 0 && cnt === _wCount && colCount > 3;
+        if (stableCheck) _wStable += 1; else _wStable = 0;
+        _wCount = cnt;
+
+        const stableEnough = _wStable >= 2; // 2秒安定で収集
+        const pageTimeout = Date.now() - _wStart > 25000;
+        if (!stableEnough && !pageTimeout) return;
+
+        _wAdv = true;
+        const q = loadJson(LS_QUEUE);
+        if (!q || !q.active) return;
+
+        q.idx = (q.idx || 0) + 1;
+        if (q.idx < q.urls.length) {
+            localStorage.setItem(LS_QUEUE, JSON.stringify(q));
+            _wAdv = false;
+            _wId = null;
+            _wCount = -1;
+            _wStable = 0;
+            location.href = q.urls[q.idx];
+        } else {
+            // 全件完了
+            q.active = false;
+            localStorage.setItem(LS_QUEUE, JSON.stringify(q));
+            showBadge('✅ 全SSD収集完了！タブを閉じます...', '#1f7a3d');
+            setTimeout(() => { try { window.close(); } catch (e) {} }, 2000);
+        }
+    }
+
+    // ===========================================================
+    // 9. Batch: SPR集計と表示
+    // ===========================================================
+
+    const BLOCK_LENGTHS = ['5h', '4.5h', '4h', '3.5h', '3h', '2.5h', '2h', '1.5h'];
+
+    /** 分数からBlock Lengthラベルに変換（±15分の幅で判定） */
+    function minutesToBlockLabel(minutes) {
+        if (minutes === null) return null;
+        const labels = [
+            { label: '5h',   min: 285 }, // 4h45m以上 → 5h
+            { label: '4.5h', min: 255 }, // 4h15m以上 → 4.5h
+            { label: '4h',   min: 225 }, // 3h45m以上 → 4h
+            { label: '3.5h', min: 195 }, // 3h15m以上 → 3.5h
+            { label: '3h',   min: 165 }, // 2h45m以上 → 3h
+            { label: '2.5h', min: 135 }, // 2h15m以上 → 2.5h
+            { label: '2h',   min: 105 }, // 1h45m以上 → 2h
+            { label: '1.5h', min: 75 }   // 1h15m以上 → 1.5h
+        ];
+        for (const l of labels) {
+            if (minutes >= l.min) return l.label;
+        }
+        return null;
+    }
+
+    /** SSDごとの package総数 / route数 と Block Lengthごとの内訳 */
+    function calculateSPR(rows, pkgColIdx, blockLengthColIdx) {
+        const ssdMap = {};
+
+        for (const row of rows) {
+            const ssd = row[0] || 'Unknown';
+            if (!ssdMap[ssd]) {
+                ssdMap[ssd] = { totalPkg: 0, totalRoutes: 0, byBlock: {} };
+                for (const bl of BLOCK_LENGTHS) ssdMap[ssd].byBlock[bl] = { pkg: 0, routes: 0 };
+            }
+            ssdMap[ssd].totalRoutes += 1;
+
+            let pkgVal = 0;
+            if (pkgColIdx >= 0) {
+                pkgVal = parseFloat((row[pkgColIdx] || '0').replace(/[^\d.]/g, ''));
+                if (isNaN(pkgVal)) pkgVal = 0;
+                ssdMap[ssd].totalPkg += pkgVal;
+            }
+
+            if (blockLengthColIdx >= 0) {
+                const blLabel = minutesToBlockLabel(parseDurationToMinutes((row[blockLengthColIdx] || '').trim()));
+                if (blLabel && ssdMap[ssd].byBlock[blLabel] !== undefined) {
+                    ssdMap[ssd].byBlock[blLabel].pkg += pkgVal;
+                    ssdMap[ssd].byBlock[blLabel].routes += 1;
+                }
+            }
+        }
+
+        const result = [];
+        for (const ssd of Object.keys(ssdMap).sort()) {
+            const d = ssdMap[ssd];
+            const spr = d.totalRoutes > 0 ? (d.totalPkg / d.totalRoutes).toFixed(1) : '0';
+            const byBlock = {};
+            for (const bl of BLOCK_LENGTHS) {
+                const b = d.byBlock[bl];
+                byBlock[bl] = b.routes > 0 ? (b.pkg / b.routes).toFixed(1) : '-';
+            }
+            result.push({ ssd, totalPkg: d.totalPkg, totalRoutes: d.totalRoutes, spr, byBlock });
+        }
+        return result;
+    }
+
+    function displaySPR(sprData) {
+        let container = document.getElementById('ufraa-spr-display');
+        if (!container) {
+            container = document.createElement('div');
+            container.id = 'ufraa-spr-display';
+            container.style.cssText =
+                'margin-top:8px;padding:10px;background:#f0f7ff;border:1px solid #0073bb;border-radius:6px;font-size:12px;';
+
+            const panel = document.getElementById('ufraa-ssd-panel');
+            if (panel && panel.parentElement) {
+                panel.parentElement.insertAdjacentElement('afterend', container);
+            } else {
+                const toolsFiltering = document.querySelector('[class*="tools-filtering_"]');
+                if (toolsFiltering && toolsFiltering.parentElement) {
+                    toolsFiltering.parentElement.parentElement.appendChild(container);
+                } else {
+                    document.body.appendChild(container);
+                }
+            }
+        }
+
+        let html = '<div style="font-weight:bold;margin-bottom:6px;color:#0073bb;">📊 SPR by SSD &amp; Block Length</div>';
+        html += '<table style="border-collapse:collapse;width:100%;font-size:11px;">';
+        html += '<tr style="background:#0073bb;color:#fff;">';
+        html += '<th style="padding:4px 6px;text-align:left">SSD</th>';
+        html += '<th style="padding:4px 6px;text-align:right">Routes</th>';
+        html += '<th style="padding:4px 6px;text-align:right">Pkgs</th>';
+        for (const bl of BLOCK_LENGTHS) html += `<th style="padding:4px 6px;text-align:right">${bl}</th>`;
+        html += '<th style="padding:4px 6px;text-align:right;background:#005a8c;">SPR</th>';
+        html += '</tr>';
+
+        let totalPkg = 0;
+        let totalRoutes = 0;
+
+        for (const d of sprData) {
+            html += '<tr style="border-bottom:1px solid #ddd;">';
+            html += `<td style="padding:3px 6px;font-weight:bold;">${d.ssd}</td>`;
+            html += `<td style="padding:3px 6px;text-align:right">${d.totalRoutes}</td>`;
+            html += `<td style="padding:3px 6px;text-align:right">${d.totalPkg}</td>`;
+            for (const bl of BLOCK_LENGTHS) {
+                html += `<td style="padding:3px 6px;text-align:right">${d.byBlock[bl]}</td>`;
+            }
+            html += `<td style="padding:3px 6px;text-align:right;font-weight:bold;background:#e8f5e9;">${d.spr}</td>`;
+            html += '</tr>';
+            totalPkg += d.totalPkg;
+            totalRoutes += d.totalRoutes;
+        }
+
+        const totalSpr = totalRoutes > 0 ? (totalPkg / totalRoutes).toFixed(1) : '0';
+        html += '<tr style="background:#e8f5e9;font-weight:bold;">';
+        html += '<td style="padding:4px 6px;">TOTAL</td>';
+        html += `<td style="padding:4px 6px;text-align:right">${totalRoutes}</td>`;
+        html += `<td style="padding:4px 6px;text-align:right">${totalPkg}</td>`;
+        for (let i = 0; i < BLOCK_LENGTHS.length; i++) html += '<td style="padding:4px 6px;text-align:right">-</td>';
+        html += `<td style="padding:4px 6px;text-align:right;background:#c8e6c9;">${totalSpr}</td>`;
+        html += '</tr>';
+        html += '</table>';
+
+        container.innerHTML = html;
+    }
+
+    // ===========================================================
+    // 10. Batch: 収集データの結合CSV出力
+    // ===========================================================
+
+    function exportCombinedCsv() {
+        const store = readCollect();
+        const entries = Object.keys(store)
+            .map((k) => store[k])
+            .sort((a, b) => (a.date + a.time < b.date + b.time ? -1 : 1));
+        if (!entries.length) return 0;
+
+        // ヘッダーは最も列数が多いエントリから取る（部分描画エントリの誤採用を防ぐ）
+        let base = [];
+        for (const e of entries) {
+            if (e.headers && e.headers.length > base.length) base = e.headers;
+        }
+
+        // DESIRED_COLUMNSに一致するカラムのインデックスを特定
+        const colMapping = [];
+        for (const desired of DESIRED_COLUMNS) {
+            const idx = base.findIndex((h) => h.trim().toLowerCase() === desired.toLowerCase());
+            if (idx >= 0) colMapping.push({ srcIdx: idx, name: base[idx] });
+        }
+
+        // フィルタ用のインデックス（元のbase配列でのインデックス）
+        const readyToWorkBaseIdx = base.findIndex((h) => {
+            const lower = h.trim().toLowerCase();
+            return lower.includes('ready to work') || lower.includes('readytowork') || lower === 'rtw';
+        });
+
+        console.log('[Ufraa] base headers:', base, 'readyToWorkBaseIdx:', readyToWorkBaseIdx);
+
+        const filteredHeaders = colMapping.map((c) => c.name);
+        const headers = ['SSD', '日付(JST)', '時刻(JST)'].concat(filteredHeaders);
+
+        // 全行を収集（フィルタ対象カラムの値は元のインデックスで参照）
+        const rows = [];
+        for (const e of entries) {
+            // 日付・時刻が取れていない不正エントリはスキップ
+            if (!e.date || !e.time) continue;
+            for (const r of e.rows || []) {
+                // 列数が基準より少ない不完全な行はスキップ
+                if (r.length < base.length) continue;
+                // Ready To Work フィルタ: 👍のみ
+                if (readyToWorkBaseIdx >= 0) {
+                    const val = (r[readyToWorkBaseIdx] || '').trim();
+                    if (!val.includes('👍')) continue;
+                }
+                rows.push([e.ssd || '', e.date, e.time].concat(colMapping.map((c) => r[c.srcIdx] || '')));
+            }
+        }
+
+        if (!rows.length) {
+            console.log('[Ufraa] フィルタ後のデータが0行です');
+            return 0;
+        }
+
+        // 出力CSV上の列位置（SSD/日付/時刻の3列オフセット）
+        const offset = 3;
+        const findCol = (needle) => {
+            const i = filteredHeaders.findIndex((h) => h.toLowerCase().includes(needle));
+            return i >= 0 ? i + offset : -1;
+        };
+        const blockStartColIdx = findCol('block start');
+        const pkgColIdx = findCol('route package count');
+        const blColIdx = findCol('block length');
+
+        // SSD列をBlock Startの時刻から再判定（planner-input生成時刻ではなく実際の枠で分類する）
+        if (blockStartColIdx >= 0) {
+            rows.forEach((row) => {
+                const label = getSSDLabel(parseTimeOfDayToMinutes((row[blockStartColIdx] || '').trim()));
+                if (label) row[0] = label;
+            });
+
+            // ソート: Block Start 昇順
+            rows.sort((a, b) => (a[blockStartColIdx] || '').trim().localeCompare((b[blockStartColIdx] || '').trim()));
+        }
+
+        displaySPR(calculateSPR(rows, pkgColIdx, blColIdx));
+
+        const sa = serviceAreaId() || 'sa';
+        downloadText(arrToCsv(headers, rows), `ssd_batch_${sa.slice(0, 8)}_${stampNow()}.csv`);
+        return rows.length;
+    }
+
+    // ===========================================================
+    // 11. Batch: planner-input解決とバッチ実行
+    // ===========================================================
+
+    /** SSDラベル（nullなら全件）→ "HH:MM" のリスト */
+    function ssdTimesForLabels(labels) {
+        const targets = labels ? SSD_SCHEDULE.filter((s) => labels.includes(s.label)) : SSD_SCHEDULE;
+        return targets.map((s) => `${p2(s.jstHour)}:${p2(s.jstMin)}`);
+    }
+
+    /** artifact-metadata APIから各SSD時刻に最も近いplanner-inputを解決 */
+    async function resolveUrls(sa, dateStr, times) {
+        const targets = times
+            .map((t) => ({ t, ms: Date.parse(`${dateStr}T${t}:00+09:00`) }))
+            .filter((x) => !Number.isNaN(x.ms));
+        if (!targets.length) return [];
+
+        const startSec = Math.floor(Math.min(...targets.map((x) => x.ms)) / 1000) - 1800;
+        const endSec = Math.floor(Math.max(...targets.map((x) => x.ms)) / 1000) + 1800;
+        const list = await fetchInputMeta(sa, startSec, endSec);
+        const withMs = list.map((a) => ({ ms: Date.parse(a.creationTime) || 0, id: a.artifactId }));
+
+        return targets.map((tg) => {
+            let best = null;
+            let bd = Infinity;
+            for (const a of withMs) {
+                const d = Math.abs(a.ms - tg.ms);
+                if (d < bd) { bd = d; best = a; }
+            }
+            return {
+                time: tg.t,
+                id: best ? best.id : null,
+                url: best ? `${location.origin}/assignment-plan/${encodeURIComponent(best.id)}` : null
+            };
+        });
+    }
+
+    /** 複数日付×SSD時刻を作業タブで巡回し、完了後に結合CSVを出力 */
+    async function runBatchExport(sa, dates, ssdLabels, statusEl) {
+        console.log('[Ufraa] runBatchExport:', sa, dates, ssdLabels);
+        if (!AUTH.creds || !AUTH.midway) {
+            statusEl.textContent = '⏳ 認証が未取得です。ページをリロードしてください。';
+            return;
+        }
+        statusEl.textContent = 'planner-inputを検索中...';
+
+        const times = ssdTimesForLabels(ssdLabels);
+        let allUrls = [];
+
+        for (let i = 0; i < dates.length; i++) {
+            statusEl.textContent = `planner-input検索中... (${i + 1}/${dates.length}日)`;
+            try {
+                const resolved = await resolveUrls(sa, dates[i], times);
+                allUrls = allUrls.concat(resolved.filter((r) => r.url).map((r) => r.url));
+            } catch (e) {
+                console.warn('[Ufraa] resolve error for', dates[i], e);
+            }
+        }
+
+        if (!allUrls.length) {
+            statusEl.textContent = '該当するAssignment Planが見つかりませんでした。';
+            return;
+        }
+
+        // 収集ストアをクリアしてキューを設定
+        writeCollect({});
+        localStorage.setItem(
+            LS_QUEUE,
+            JSON.stringify({ urls: allUrls, idx: 0, active: true, total: allUrls.length, ts: Date.now() })
+        );
+
+        // 作業タブを開く
+        const w = window.open(allUrls[0], 'ufraaSsdWorker', 'width=800,height=600,left=0,top=0');
+        if (!w) {
+            statusEl.textContent = '⚠️ ポップアップがブロックされました。このサイトのポップアップを許可してください。';
+            return;
+        }
+        window.focus();
+
+        statusEl.textContent = `0 / ${allUrls.length} 取得中...`;
+
+        // メインタブでlocalStorageを監視して進捗表示
+        const progressInterval = setInterval(() => {
+            const q = loadJson(LS_QUEUE);
+            if (!q) { clearInterval(progressInterval); return; }
+
+            if (q.active) {
+                statusEl.textContent = `${q.idx || 0} / ${q.total || allUrls.length} 取得中...`;
+                return;
+            }
+
+            clearInterval(progressInterval);
+            const count = Object.keys(readCollect()).length;
+            const rowCount = exportCombinedCsv();
+            statusEl.textContent =
+                rowCount > 0
+                    ? `✅ 完了！ ${count}時刻 / 計${rowCount}行をCSV保存しました。`
+                    : '⚠️ データを取得できませんでした。';
+            localStorage.removeItem(LS_QUEUE);
+        }, 1000);
+    }
+
+    // ===========================================================
+    // 12. Batch: Service AreasページのパネルUI
+    // ===========================================================
+
+    function injectPanel() {
+        if (!serviceAreaId()) return;
+        if (document.getElementById('ufraa-ssd-panel')) return;
+        if (!document.body) return;
+
+        // "Assignment Plans" セクション内のtools-filtering_を探す
+        let toolsFiltering = null;
+        document.querySelectorAll('[class*="heading-text_"]').forEach((h) => {
+            if (h.textContent.trim() !== 'Assignment Plans') return;
+            const container =
+                h.closest('[class*="variant-container_"]') ||
+                h.closest('[class*="header-controls_"]')?.parentElement;
+            if (container) toolsFiltering = container.querySelector('[class*="tools-filtering_"]');
+        });
+        if (!toolsFiltering) toolsFiltering = document.querySelector('[class*="tools-filtering_"]');
+        if (!toolsFiltering) return;
+
+        const toolsRow = toolsFiltering.parentElement;
+
+        const panel = document.createElement('div');
+        panel.id = 'ufraa-ssd-panel';
+        panel.style.cssText = 'display:flex;align-items:center;gap:8px;margin-left:auto;';
+
+        // 認証状態
+        const authSpan = document.createElement('span');
+        authSpan.id = 'ufraa-ssd-auth';
+        authSpan.style.cssText = 'font-size:10px;margin-right:4px;';
+
+        const mkLabel = (text) => {
+            const s = document.createElement('span');
+            s.textContent = text;
+            s.style.cssText = 'font-size:11px;color:#333;';
+            return s;
+        };
+        const mkDateInput = (id) => {
+            const i = document.createElement('input');
+            i.id = id;
+            i.type = 'date';
+            i.value = todayJst();
+            i.style.cssText = 'padding:4px 6px;border:1px solid #aaa;border-radius:4px;font-size:13px;height:32px;';
+            return i;
+        };
+
+        const dateFromInput = mkDateInput('ufraa-ssd-date-from');
+        const dateToInput = mkDateInput('ufraa-ssd-date-to');
+
+        // SSDドロップダウン
+        const select = document.createElement('select');
+        select.id = 'ufraa-ssd-select';
+        select.style.cssText = 'padding:4px 6px;border:1px solid #aaa;border-radius:4px;font-size:13px;height:32px;';
+        const allOpt = document.createElement('option');
+        allOpt.value = 'ALL';
+        allOpt.textContent = '全SSD';
+        select.appendChild(allOpt);
+        SSD_SCHEDULE.forEach((s) => {
+            const opt = document.createElement('option');
+            opt.value = s.label;
+            opt.textContent = `${s.label} (${p2(s.jstHour)}:${p2(s.jstMin)})`;
+            select.appendChild(opt);
+        });
+
+        // 実行ボタン
+        const runBtn = document.createElement('button');
+        runBtn.id = 'ufraa-ssd-run';
+        runBtn.textContent = 'CSV出力';
+        runBtn.style.cssText =
+            'padding:0 16px;background:#0073bb;color:#fff;border:none;border-radius:4px;cursor:pointer;' +
+            'font-size:13px;font-weight:bold;height:32px;line-height:32px;';
+        runBtn.addEventListener('mouseover', () => (runBtn.style.background = '#005a8c'));
+        runBtn.addEventListener('mouseout', () => (runBtn.style.background = '#0073bb'));
+
+        // ステータス
+        const statusSpan = document.createElement('span');
+        statusSpan.id = 'ufraa-ssd-status';
+        statusSpan.style.cssText = 'font-size:10px;color:#555;';
+
+        runBtn.addEventListener('click', async () => {
+            const sa = serviceAreaId();
+            if (!sa) { statusSpan.textContent = 'service-areasページで実行してください。'; return; }
+
+            const dateFrom = dateFromInput.value;
+            const dateTo = dateToInput.value;
+            if (!dateFrom || !dateTo) { statusSpan.textContent = '日付を選択してください。'; return; }
+            if (dateFrom > dateTo) { statusSpan.textContent = 'From日付がTo日付より後です。'; return; }
+
+            const labels = select.value === 'ALL' ? null : [select.value];
+
+            // 日付範囲から全日付リストを生成
+            const dates = [];
+            const current = new Date(dateFrom + 'T00:00:00');
+            const end = new Date(dateTo + 'T00:00:00');
+            while (current <= end) {
+                dates.push(`${current.getFullYear()}-${p2(current.getMonth() + 1)}-${p2(current.getDate())}`);
+                current.setDate(current.getDate() + 1);
+            }
+
+            runBtn.disabled = true;
+            runBtn.style.opacity = '0.6';
+            try {
+                await runBatchExport(sa, dates, labels, statusSpan);
+            } catch (e) {
+                console.error('[Ufraa] batch error:', e);
+                statusSpan.textContent = 'エラー: ' + e.message;
+            } finally {
+                runBtn.disabled = false;
+                runBtn.style.opacity = '1';
+            }
+        });
+
+        panel.appendChild(authSpan);
+        panel.appendChild(mkLabel('From:'));
+        panel.appendChild(dateFromInput);
+        panel.appendChild(mkLabel('To:'));
+        panel.appendChild(dateToInput);
+        panel.appendChild(select);
+        panel.appendChild(runBtn);
+        panel.appendChild(statusSpan);
+
+        toolsRow.style.display = 'flex';
+        toolsRow.style.alignItems = 'center';
+        toolsRow.appendChild(panel);
+
+        // 認証状態を定期更新
+        setInterval(() => {
+            const ok = AUTH.creds && AUTH.midway;
+            authSpan.textContent = ok ? '✅' : '⏳';
+            authSpan.title = ok ? '認証取得済み' : '認証待ち（リロードで取得）';
+        }, 1500);
+    }
+
+    // ===========================================================
+    // 13. 初期化
+    //     SPA遷移でスクリプトは再実行されないため、
+    //     ページ種別はtickごとに判定する
+    // ===========================================================
+
+    let _liveStarted = false;
+
+    /** Live画面用の定期実行とDOM監視を一度だけ起動する */
+    function startLiveFeatures() {
+        if (_liveStarted || !document.body) return;
+        _liveStarted = true;
+
+        setInterval(runGapCheck, CHECK_INTERVAL_MS);
+
+        const observer = new MutationObserver(() => {
+            clearTimeout(observer._timeout);
+            observer._timeout = setTimeout(() => {
+                if (!isLivePage()) return;
+                runGapCheck();
+                ensureLiveUi();
+            }, 1000);
+        });
+        observer.observe(document.body, { childList: true, subtree: true, characterData: true });
+
+        console.log('[Ufraa] Live画面の Gap Check / CSV出力 を起動');
+    }
+
+    function tick() {
+        if (!document.body) return;
+
+        if (isLivePage()) {
+            startLiveFeatures();
+            ensureLiveUi();
+        }
+        if (serviceAreaId()) injectPanel();
+        if (artifactIdFromPath()) collectAssignmentPage();
+    }
+
+    setInterval(tick, TICK_INTERVAL_MS);
+    if (document.readyState !== 'loading') tick();
+    document.addEventListener('DOMContentLoaded', tick);
+
+    console.log('[Ufraa] 起動 (Assignment Plan + SSD Batch CSV)');
+})();
