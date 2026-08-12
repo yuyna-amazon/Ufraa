@@ -11,24 +11,6 @@
 // @grant        none
 // @run-at       document-start
 // ==/UserScript==
-
-/*
- * 構成
- *   1. 共通定義 / ページ判定
- *   2. 認証フック（document-start で fetch/XHR を差し替えて creds と midway token を捕捉）
- *   3. SigV4署名 / artifact-metadata API
- *   4. 共通ユーティリティ
- *   5. Preferences（表示カラム）＋ Filter 入力
- *   6. Live画面: Gap Check / SSDラベル / 行ハイライト
- *   7. Live画面: ツールバーUI（SSD絞り込み・CSV出力・設定）
- *   8. Batch: Assignment Planページの巡回収集
- *   9. Batch: SPR集計と表示
- *  10. Batch: 収集データの結合CSV出力
- *  11. Batch: planner-input解決とバッチ実行
- *  12. Batch: Service AreasページのパネルUI
- *  13. 初期化
- */
-
 (function () {
     'use strict';
 
