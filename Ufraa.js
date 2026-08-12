@@ -6,8 +6,8 @@
 // @author       yuyna
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=amazon.com
 // @match        https://viz-fe.ufraa.last-mile.amazon.dev/*
-// @updateURL    https://raw.githubusercontent.com/yuyna-amazon/Ufraa/main/Ufraa.js
-// @downloadURL  https://raw.githubusercontent.com/yuyna-amazon/Ufraa/main/Ufraa.js
+// @updateURL    https://raw.githubusercontent.com/yuyna-amazon/Ufraa/main/Ufraa.user.js
+// @downloadURL  https://raw.githubusercontent.com/yuyna-amazon/Ufraa/main/Ufraa.user.js
 // @grant        none
 // @run-at       document-start
 // ==/UserScript==
