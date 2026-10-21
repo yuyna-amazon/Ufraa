@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ufraa
 // @namespace    https://github.com/yuyna-amazon/Ufraa
-// @version      3.3
+// @version      3.6
 // @description  Ufraa Assignment Plan: Route Duration乖離表示 + SSDラベル + CSV出力 / Service AreasからSSD時間帯を一括巡回してCSV出力
 // @author       yuyna
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=amazon.com
@@ -22,8 +22,8 @@
     const CHECK_INTERVAL_MS = 5000;
     const TICK_INTERVAL_MS = 500;
 
-    const CYCLE_SETTINGS_VERSION = 2;
-    const LEGACY_SIX_CYCLE_DEFAULTS = Object.freeze([
+    const CYCLE_SETTINGS_VERSION = 4;
+    const LEGACY_SIX_CYCLE_DEFAULTS_UNDERSCORED_0600 = Object.freeze([
         Object.freeze({ name: 'SSD_1',   endTime: '06:00' }),
         Object.freeze({ name: 'SSD_1_B', endTime: '09:00' }),
         Object.freeze({ name: 'SSD_2',   endTime: '12:00' }),
@@ -31,18 +31,26 @@
         Object.freeze({ name: 'SSD_3_B', endTime: '19:00' }),
         Object.freeze({ name: 'SSD_4',   endTime: '22:00' })
     ]);
+    const LEGACY_SIX_CYCLE_DEFAULTS_NON_UNDERSCORED_0600 = Object.freeze([
+        Object.freeze({ name: 'SSD1',   endTime: '06:00' }),
+        Object.freeze({ name: 'SSD1_B', endTime: '09:00' }),
+        Object.freeze({ name: 'SSD2',   endTime: '12:00' }),
+        Object.freeze({ name: 'SSD3',   endTime: '16:00' }),
+        Object.freeze({ name: 'SSD3_B', endTime: '19:00' }),
+        Object.freeze({ name: 'SSD4',   endTime: '22:00' })
+    ]);
     const DEFAULT_CYCLE_SETTINGS = Object.freeze({
         version: CYCLE_SETTINGS_VERSION,
         selectedCycleCount: 6,
         configs: Object.freeze({
             '6': Object.freeze({
                 cycles: Object.freeze([
-                    Object.freeze({ name: 'SSD1',   endTime: '06:00' }),
-                    Object.freeze({ name: 'SSD1_B', endTime: '09:00' }),
-                    Object.freeze({ name: 'SSD2',   endTime: '12:00' }),
-                    Object.freeze({ name: 'SSD3',   endTime: '16:00' }),
-                    Object.freeze({ name: 'SSD3_B', endTime: '19:00' }),
-                    Object.freeze({ name: 'SSD4',   endTime: '22:00' })
+                    Object.freeze({ name: 'SSD1',   endTime: '05:55' }),
+                    Object.freeze({ name: 'SSD1_B', endTime: '08:55' }),
+                    Object.freeze({ name: 'SSD2',   endTime: '11:55' }),
+                    Object.freeze({ name: 'SSD3',   endTime: '15:55' }),
+                    Object.freeze({ name: 'SSD3_B', endTime: '18:55' }),
+                    Object.freeze({ name: 'SSD4',   endTime: '21:55' })
                 ])
             }),
             '8': Object.freeze({
@@ -319,13 +327,19 @@
     }
 
     function migrateCycleSettings(candidate) {
-        if (!candidate || candidate.version !== 1) return candidate;
+        if (!candidate || ![1, 2, 3].includes(candidate.version)) return candidate;
 
         const migrated = JSON.parse(JSON.stringify(candidate));
+        if (migrated.selectedCycleCount === '6' || migrated.selectedCycleCount === '8') {
+            migrated.selectedCycleCount = Number(migrated.selectedCycleCount);
+        }
+
         const sixCycles = migrated.configs && migrated.configs['6'] && migrated.configs['6'].cycles;
-        if (cyclesMatch(sixCycles, LEGACY_SIX_CYCLE_DEFAULTS)) {
-            const newDefaults = DEFAULT_CYCLE_SETTINGS.configs['6'].cycles;
-            sixCycles.forEach((cycle, index) => { cycle.name = newDefaults[index].name; });
+        const matchesGeneratedSixCycleDefaults =
+            cyclesMatch(sixCycles, LEGACY_SIX_CYCLE_DEFAULTS_UNDERSCORED_0600) ||
+            cyclesMatch(sixCycles, LEGACY_SIX_CYCLE_DEFAULTS_NON_UNDERSCORED_0600);
+        if (matchesGeneratedSixCycleDefaults) {
+            migrated.configs['6'].cycles = DEFAULT_CYCLE_SETTINGS.configs['6'].cycles.map((cycle) => ({ ...cycle }));
         }
         migrated.version = CYCLE_SETTINGS_VERSION;
         return migrated;
@@ -406,18 +420,11 @@
     }
 
     function activeCycleDisplaySchedule() {
-        const subtractFiveMinutes = activeCycleSettings.selectedCycleCount === 6;
-        return activeCycles().map((cycle) => {
-            let endTime = cycle.endTime;
-            if (subtractFiveMinutes) {
-                const displayMinutes = (timeToMinutes(cycle.endTime) - 5 + 1440) % 1440;
-                endTime = `${p2(Math.floor(displayMinutes / 60))}:${p2(displayMinutes % 60)}`;
-            }
-            return { label: cycle.name, endTime };
-        });
+        return activeCycles().map((cycle) => ({ label: cycle.name, endTime: cycle.endTime }));
     }
 
-    function activeCycleQuerySchedule() {
+    /** planner-input検索はFinal Dispatch時刻を使うため、保存されたCycle終了時刻から5分戻す */
+    function activePlannerFinalDispatchSchedule() {
         return activeCycles().map((cycle) => {
             const targetMinutes = (timeToMinutes(cycle.endTime) - 5 + 1440) % 1440;
             return {
@@ -451,18 +458,18 @@
         };
     }
 
-    /** 有効なCycle設定の中で最も近い時刻のラベルを返す（±30分以内） */
+    /** 有効なCycle設定の終了時刻に最も近いラベルを返す（±30分以内） */
     function ssdLabelFromJstTime(timeStr) {
         if (!timeStr) return 'Unknown';
         const [h, m] = timeStr.split(':').map(Number);
         const minutes = h * 60 + m;
         let best = null;
         let bestDiff = Infinity;
-        for (const ssd of activeCycleQuerySchedule()) {
-            const diff = Math.abs(minutes - (ssd.jstHour * 60 + ssd.jstMin));
-            if (diff < bestDiff) { bestDiff = diff; best = ssd; }
+        for (const cycle of activeCycles()) {
+            const diff = Math.abs(minutes - timeToMinutes(cycle.endTime));
+            if (diff < bestDiff) { bestDiff = diff; best = cycle; }
         }
-        return best && bestDiff <= 30 ? best.label : 'Unknown';
+        return best && bestDiff <= 30 ? best.name : 'Unknown';
     }
 
     /** "2026-08-07 05:40:00 JST" / "5:40" / "05:40:00" → 0:00からの分数 */
@@ -2020,9 +2027,9 @@
     // 11. Batch: planner-input解決とバッチ実行
     // ===========================================================
 
-    /** SSDラベル（nullなら全件）→ "HH:MM" のリスト */
+    /** SSDラベル（nullなら全件）→ planner-inputのFinal Dispatch "HH:MM" リスト */
     function ssdTimesForLabels(labels) {
-        const schedule = activeCycleQuerySchedule();
+        const schedule = activePlannerFinalDispatchSchedule();
         const targets = labels ? schedule.filter((s) => labels.includes(s.label)) : schedule;
         return targets.map((s) => `${p2(s.jstHour)}:${p2(s.jstMin)}`);
     }
