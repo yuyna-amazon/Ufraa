@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ufraa
 // @namespace    https://github.com/yuyna-amazon/Ufraa
-// @version      3.1
+// @version      3.3
 // @description  Ufraa Assignment Plan: Route Duration乖離表示 + SSDラベル + CSV出力 / Service AreasからSSD時間帯を一括巡回してCSV出力
 // @author       yuyna
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=amazon.com
@@ -22,25 +22,43 @@
     const CHECK_INTERVAL_MS = 5000;
     const TICK_INTERVAL_MS = 500;
 
-    // Block Start（分換算）→ SSDサイクル判定
-    const SSD_FILTERS = [
-        { label: 'SSD_1',   min: 0,    max: 360 },
-        { label: 'SSD_1_B', min: 360,  max: 540 },
-        { label: 'SSD_2',   min: 540,  max: 720 },
-        { label: 'SSD_3',   min: 720,  max: 960 },
-        { label: 'SSD_3_B', min: 960,  max: 1140 },
-        { label: 'SSD_4',   min: 1140, max: Infinity }
-    ];
-
-    // バッチ巡回で狙う planner-input の生成時刻 (JST)
-    const SSD_SCHEDULE = [
-        { label: 'SSD_1',   jstHour: 5,  jstMin: 55 },
-        { label: 'SSD_1_B', jstHour: 8,  jstMin: 55 },
-        { label: 'SSD_2',   jstHour: 11, jstMin: 55 },
-        { label: 'SSD_3',   jstHour: 15, jstMin: 55 },
-        { label: 'SSD_3_B', jstHour: 18, jstMin: 55 },
-        { label: 'SSD_4',   jstHour: 21, jstMin: 55 }
-    ];
+    const CYCLE_SETTINGS_VERSION = 2;
+    const LEGACY_SIX_CYCLE_DEFAULTS = Object.freeze([
+        Object.freeze({ name: 'SSD_1',   endTime: '06:00' }),
+        Object.freeze({ name: 'SSD_1_B', endTime: '09:00' }),
+        Object.freeze({ name: 'SSD_2',   endTime: '12:00' }),
+        Object.freeze({ name: 'SSD_3',   endTime: '16:00' }),
+        Object.freeze({ name: 'SSD_3_B', endTime: '19:00' }),
+        Object.freeze({ name: 'SSD_4',   endTime: '22:00' })
+    ]);
+    const DEFAULT_CYCLE_SETTINGS = Object.freeze({
+        version: CYCLE_SETTINGS_VERSION,
+        selectedCycleCount: 6,
+        configs: Object.freeze({
+            '6': Object.freeze({
+                cycles: Object.freeze([
+                    Object.freeze({ name: 'SSD1',   endTime: '06:00' }),
+                    Object.freeze({ name: 'SSD1_B', endTime: '09:00' }),
+                    Object.freeze({ name: 'SSD2',   endTime: '12:00' }),
+                    Object.freeze({ name: 'SSD3',   endTime: '16:00' }),
+                    Object.freeze({ name: 'SSD3_B', endTime: '19:00' }),
+                    Object.freeze({ name: 'SSD4',   endTime: '22:00' })
+                ])
+            }),
+            '8': Object.freeze({
+                cycles: Object.freeze([
+                    Object.freeze({ name: 'SSDF_1', endTime: '05:35' }),
+                    Object.freeze({ name: 'SSDF_2', endTime: '08:35' }),
+                    Object.freeze({ name: 'SSDF_3', endTime: '11:35' }),
+                    Object.freeze({ name: 'SSDF_4', endTime: '14:35' }),
+                    Object.freeze({ name: 'SSDF_5', endTime: '17:35' }),
+                    Object.freeze({ name: 'SSDF_6', endTime: '19:35' }),
+                    Object.freeze({ name: 'SSDF_7', endTime: '21:20' }),
+                    Object.freeze({ name: 'SSDF_8', endTime: '23:05' })
+                ])
+            })
+        })
+    });
 
     // Preferencesで表示ONにするカラム（これ以外はOFF）／CSVに出力するカラム
     const DESIRED_COLUMNS = [
@@ -61,6 +79,13 @@
     // Live画面のFilter入力欄に自動入力する文字列
     const FILTER_TEXT = 'Open,Waiting,Unknown';
 
+    const BLOCK_START_SORT_SELECTOR = '[data-focus-id="sorting-control-driverShiftStart"]';
+    const BLOCK_START_SORT_DEBOUNCE_MS = 300;
+    const BLOCK_START_SORT_MAX_CLICKS = 3;
+    const BLOCK_START_SORT_CONFIRM_MS = 600;
+    const BLOCK_START_SORT_STABILIZE_MS = 2000;
+    const BLOCK_START_SORT_MAX_RECOVERIES = 1;
+
     // artifact-metadata API
     const HOST = 'fulv8diza1.execute-api.us-west-2.amazonaws.com';
     const REGION = 'us-west-2';
@@ -71,6 +96,7 @@
     // localStorageキー
     const LS_COLLECT = 'ufraaSsdCollected';
     const LS_QUEUE = 'ufraaSsdWorkerQueue';
+    const LS_CYCLE_SETTINGS = 'ufraaCycleSettings_v1';
 
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     const p2 = (n) => String(n).padStart(2, '0');
@@ -277,6 +303,131 @@
         try { return JSON.parse(localStorage.getItem(key) || 'null'); } catch (e) { return null; }
     }
 
+    function copyDefaultCycleSettings() {
+        return JSON.parse(JSON.stringify(DEFAULT_CYCLE_SETTINGS));
+    }
+
+    function timeToMinutes(time) {
+        const match = typeof time === 'string' && time.match(/^([01]\d|2[0-3]):([0-5]\d)$/);
+        return match ? Number(match[1]) * 60 + Number(match[2]) : null;
+    }
+
+    function cyclesMatch(cycles, expected) {
+        return Array.isArray(cycles) && cycles.length === expected.length && cycles.every((cycle, index) =>
+            cycle && cycle.name === expected[index].name && cycle.endTime === expected[index].endTime
+        );
+    }
+
+    function migrateCycleSettings(candidate) {
+        if (!candidate || candidate.version !== 1) return candidate;
+
+        const migrated = JSON.parse(JSON.stringify(candidate));
+        const sixCycles = migrated.configs && migrated.configs['6'] && migrated.configs['6'].cycles;
+        if (cyclesMatch(sixCycles, LEGACY_SIX_CYCLE_DEFAULTS)) {
+            const newDefaults = DEFAULT_CYCLE_SETTINGS.configs['6'].cycles;
+            sixCycles.forEach((cycle, index) => { cycle.name = newDefaults[index].name; });
+        }
+        migrated.version = CYCLE_SETTINGS_VERSION;
+        return migrated;
+    }
+
+    function validateCycleSettings(candidate) {
+        if (!candidate || candidate.version !== CYCLE_SETTINGS_VERSION) {
+            return { ok: false, message: '設定データのバージョンが不正です。' };
+        }
+        if (candidate.selectedCycleCount !== 6 && candidate.selectedCycleCount !== 8) {
+            return { ok: false, message: 'Cycle数は6または8を選択してください。' };
+        }
+        if (!candidate.configs || typeof candidate.configs !== 'object') {
+            return { ok: false, message: 'Cycle設定が見つかりません。' };
+        }
+
+        const normalized = { version: CYCLE_SETTINGS_VERSION, selectedCycleCount: candidate.selectedCycleCount, configs: {} };
+        for (const count of [6, 8]) {
+            const config = candidate.configs[String(count)];
+            if (!config || !Array.isArray(config.cycles) || config.cycles.length !== count) {
+                return { ok: false, message: `${count} Cycleの行数が不正です。` };
+            }
+
+            const names = new Set();
+            const cycles = [];
+            let previousEnd = -1;
+            for (let index = 0; index < config.cycles.length; index += 1) {
+                const cycle = config.cycles[index];
+                const name = cycle && typeof cycle.name === 'string' ? cycle.name.trim() : '';
+                const endTime = cycle && typeof cycle.endTime === 'string' ? cycle.endTime.trim() : '';
+                if (!name) {
+                    return { ok: false, message: `${count} Cycleの${index + 1}行目にCycleNameを入力してください。` };
+                }
+                if (names.has(name)) {
+                    return { ok: false, message: `${count} Cycle内でCycleName「${name}」が重複しています。` };
+                }
+                const endMinutes = timeToMinutes(endTime);
+                if (endMinutes === null) {
+                    return { ok: false, message: `${count} Cycleの${index + 1}行目の終了時刻をHH:MM形式で入力してください。` };
+                }
+                if (endMinutes <= previousEnd) {
+                    return { ok: false, message: `${count} Cycleの終了時刻は上から昇順に設定してください。` };
+                }
+                names.add(name);
+                previousEnd = endMinutes;
+                cycles.push({ name, endTime });
+            }
+            normalized.configs[String(count)] = { cycles };
+        }
+        return { ok: true, settings: normalized };
+    }
+
+    function loadCycleSettings() {
+        const stored = loadJson(LS_CYCLE_SETTINGS);
+        const candidate = migrateCycleSettings(stored);
+        const result = validateCycleSettings(candidate);
+        if (!result.ok) return copyDefaultCycleSettings();
+
+        if (stored && stored.version !== CYCLE_SETTINGS_VERSION) {
+            try { localStorage.setItem(LS_CYCLE_SETTINGS, JSON.stringify(result.settings)); } catch (e) {}
+        }
+        return result.settings;
+    }
+
+    let activeCycleSettings = loadCycleSettings();
+
+    function activeCycles() {
+        return activeCycleSettings.configs[String(activeCycleSettings.selectedCycleCount)].cycles;
+    }
+
+    function activeCycleFilters() {
+        const cycles = activeCycles();
+        return cycles.map((cycle, index) => ({
+            label: cycle.name,
+            min: index === 0 ? 0 : timeToMinutes(cycles[index - 1].endTime),
+            max: index === cycles.length - 1 ? Infinity : timeToMinutes(cycle.endTime)
+        }));
+    }
+
+    function activeCycleDisplaySchedule() {
+        const subtractFiveMinutes = activeCycleSettings.selectedCycleCount === 6;
+        return activeCycles().map((cycle) => {
+            let endTime = cycle.endTime;
+            if (subtractFiveMinutes) {
+                const displayMinutes = (timeToMinutes(cycle.endTime) - 5 + 1440) % 1440;
+                endTime = `${p2(Math.floor(displayMinutes / 60))}:${p2(displayMinutes % 60)}`;
+            }
+            return { label: cycle.name, endTime };
+        });
+    }
+
+    function activeCycleQuerySchedule() {
+        return activeCycles().map((cycle) => {
+            const targetMinutes = (timeToMinutes(cycle.endTime) - 5 + 1440) % 1440;
+            return {
+                label: cycle.name,
+                jstHour: Math.floor(targetMinutes / 60),
+                jstMin: targetMinutes % 60
+            };
+        });
+    }
+
     function todayJst() {
         const d = new Date(Date.now() + 9 * 3600 * 1000);
         return `${d.getUTCFullYear()}-${p2(d.getUTCMonth() + 1)}-${p2(d.getUTCDate())}`;
@@ -300,14 +451,14 @@
         };
     }
 
-    /** SSD_SCHEDULEの中で最も近い時刻のラベルを返す（±30分以内） */
+    /** 有効なCycle設定の中で最も近い時刻のラベルを返す（±30分以内） */
     function ssdLabelFromJstTime(timeStr) {
         if (!timeStr) return 'Unknown';
         const [h, m] = timeStr.split(':').map(Number);
         const minutes = h * 60 + m;
         let best = null;
         let bestDiff = Infinity;
-        for (const ssd of SSD_SCHEDULE) {
+        for (const ssd of activeCycleQuerySchedule()) {
             const diff = Math.abs(minutes - (ssd.jstHour * 60 + ssd.jstMin));
             if (diff < bestDiff) { bestDiff = diff; best = ssd; }
         }
@@ -322,10 +473,10 @@
         return parseInt(match[1]) * 60 + parseInt(match[2]);
     }
 
-    /** 分数からSSD_FILTERSのラベルを判定 */
+    /** 分数から有効なCycle設定のラベルを判定 */
     function getSSDLabel(minutes) {
         if (minutes === null) return null;
-        for (const filter of SSD_FILTERS) {
+        for (const filter of activeCycleFilters()) {
             if (minutes >= filter.min && minutes < filter.max) return filter.label;
         }
         return null;
@@ -375,6 +526,322 @@
         const sign = minutes < 0 ? '-' : '+';
         if (h > 0) return `${sign}${h}h ${m}m`;
         return `${sign}${m}m`;
+    }
+
+    // --- Block Start 昇順ソート ---
+
+    let _blockStartSortStarted = false;
+    let _blockStartSortRoute = '';
+    let _blockStartSortLifecycle = 0;
+    let _blockStartSortInitialApplied = false;
+    let _blockStartSortManualOverride = false;
+    let _blockStartSortPending = false;
+    let _blockStartSortFailures = 0;
+    let _blockStartSortHandled = new WeakSet();
+    let _blockStartSortAppliedControl = null;
+    let _blockStartSortAppliedTable = null;
+    let _blockStartSortStabilizeUntil = 0;
+    let _blockStartSortRecoveries = 0;
+    const _blockStartSortUnknown = new WeakSet();
+
+    function syncBlockStartSortRoute() {
+        const route = location.pathname + location.search + location.hash;
+        if (route === _blockStartSortRoute) return;
+        _blockStartSortRoute = route;
+        _blockStartSortLifecycle += 1;
+        _blockStartSortInitialApplied = false;
+        _blockStartSortManualOverride = false;
+        _blockStartSortPending = false;
+        _blockStartSortFailures = 0;
+        _blockStartSortHandled = new WeakSet();
+        _blockStartSortAppliedControl = null;
+        _blockStartSortAppliedTable = null;
+        _blockStartSortStabilizeUntil = 0;
+        _blockStartSortRecoveries = 0;
+    }
+
+    function isUsableSortControl(control) {
+        if (!control || control.disabled) return false;
+        const hidden = control.closest('[aria-hidden="true"], [hidden]');
+        const disabled = control.closest('[aria-disabled="true"], [disabled]');
+        return !hidden && !disabled && control.getClientRects().length > 0;
+    }
+
+    function firstUsableSortControl(controls) {
+        return controls.find(isUsableSortControl) || null;
+    }
+
+    /** Block Start表示値を秒単位で比較する。空欄・プレースホルダ・不正値は除外する。 */
+    function parseBlockStartTimeToSeconds(timeStr) {
+        if (!timeStr || typeof timeStr !== 'string') return null;
+        const text = timeStr.trim();
+        if (!text || /^(?:[-–—]+|n\/?a|null|tbd|pending|unknown|not\s+available)$/i.test(text)) return null;
+        const match = text.match(/(?:^|[\sT])(\d{1,2}):(\d{2})(?::(\d{2}))?(?=$|\s)/);
+        if (!match) return null;
+        const hours = Number(match[1]);
+        const minutes = Number(match[2]);
+        const seconds = match[3] === undefined ? 0 : Number(match[3]);
+        if (hours > 23 || minutes > 59 || seconds > 59) return null;
+        return hours * 3600 + minutes * 60 + seconds;
+    }
+
+    function getBlockStartRowOrder(control) {
+        const headerCell = control && control.closest('th, [role="columnheader"]');
+        const table = headerCell && headerCell.closest('table, [role="table"]');
+        const headerRow = headerCell && headerCell.closest('tr, [role="row"]');
+        if (!headerCell || !table || !headerRow) return { status: 'insufficient', table: null };
+
+        const headerCells = Array.from(headerRow.children).filter((cell) =>
+            cell.matches('th, [role="columnheader"]')
+        );
+        const columnIndex = headerCells.indexOf(headerCell);
+        if (columnIndex < 0) return { status: 'insufficient', table };
+
+        const times = [];
+        for (const row of table.querySelectorAll('tbody tr, [role="rowgroup"] [role="row"]')) {
+            if (row.closest('[aria-hidden="true"], [hidden]') || row.getClientRects().length === 0) continue;
+            const cells = Array.from(row.children).filter((cell) => cell.matches('td, [role="cell"]'));
+            const cell = cells[columnIndex];
+            const seconds = parseBlockStartTimeToSeconds(cell && cell.textContent);
+            if (seconds !== null) times.push(seconds);
+        }
+        if (times.length < 2) return { status: 'insufficient', table };
+        for (let index = 1; index < times.length; index += 1) {
+            if (times[index] < times[index - 1]) return { status: 'not-ascending', table };
+        }
+        return { status: 'ascending', table };
+    }
+
+    function markBlockStartSortApplied(control, table) {
+        _blockStartSortFailures = 0;
+        _blockStartSortInitialApplied = true;
+        _blockStartSortAppliedControl = control;
+        _blockStartSortAppliedTable = table;
+        _blockStartSortStabilizeUntil = Date.now() + BLOCK_START_SORT_STABILIZE_MS;
+    }
+
+    /** data-focus-idを優先し、存在しない場合だけ見出しテキストから探す */
+    function findBlockStartSortControl() {
+        const primary = Array.from(document.querySelectorAll(BLOCK_START_SORT_SELECTOR));
+        if (primary.length) return firstUsableSortControl(primary);
+
+        const textElements = document.querySelectorAll(
+            '[class*="header-cell-text_"], th div, [role="columnheader"] div'
+        );
+        const fallback = [];
+        for (const textElement of textElements) {
+            if ((textElement.textContent || '').trim() !== 'Block Start') continue;
+            const headerCell = textElement.closest('th, [role="columnheader"]');
+            if (!headerCell) continue;
+            const explicitControl =
+                textElement.closest('[data-focus-id^="sorting-control-"]') ||
+                headerCell.querySelector('[data-focus-id^="sorting-control-"]');
+            const textButton = textElement.closest('[role="button"]');
+            const control = explicitControl || textButton;
+            if (control && headerCell.contains(control) && !fallback.includes(control)) fallback.push(control);
+        }
+        return firstUsableSortControl(fallback);
+    }
+
+    /** Cloudscapeのaria-sort、方向クラス、標準caretの順に現在状態を判定する */
+    function getBlockStartSortState(control) {
+        const headerCell = control.closest('th, [role="columnheader"]');
+        const ariaSort = (
+            (headerCell && headerCell.getAttribute('aria-sort')) ||
+            control.getAttribute('aria-sort') ||
+            ''
+        ).toLowerCase();
+        if (ariaSort === 'ascending' || ariaSort === 'descending' || ariaSort === 'none') return ariaSort;
+
+        const headerClass = headerCell ? String(headerCell.className || '') : '';
+        if (headerClass.includes('header-cell-ascending_')) return 'ascending';
+        if (headerClass.includes('header-cell-descending_')) return 'descending';
+
+        const sortingIcon = control.querySelector('[class*="sorting-icon_"]');
+        const namedIconClass = sortingIcon ? String(sortingIcon.querySelector('span')?.className || '') : '';
+        if (namedIconClass.includes('name-caret-up-filled_')) return 'ascending';
+        if (namedIconClass.includes('name-caret-down-filled_')) return 'descending';
+        if (namedIconClass.includes('name-caret-down_')) return 'none';
+
+        const path = sortingIcon && sortingIcon.querySelector('svg path[d]');
+        if (path) {
+            // ここに到達するのは aria-sort も方向クラスも named caret も無い場合のみ。
+            // 実機は全列 aria-sort="none" で、ソートアイコンは filled も方向クラスも持たない
+            // 下向き三角 path になる。この下向き三角は Cloudscape の「未ソート(ニュートラル)」
+            // 状態のアイコンであり、明示シグナル(aria-sort / 方向クラス / filled / named caret)を
+            // 伴わない限り単独で降順を意味しない。よって下向き三角単独は none(未ソート)と扱う。
+            // 上向き三角は昇順シグナルとして ascending を返す。
+            const d = (path.getAttribute('d') || '').replace(/\s+/g, '').toLowerCase();
+            if (d === 'm8546h4l4-6z') return 'ascending';
+            if (d === 'm8114-6h4l46z') return 'none';
+        }
+
+        // カスタムアイコン等で方向を確実に判別できない場合、推測クリックはしない。
+        return 'unknown';
+    }
+
+    function applyBlockStartAscendingSort() {
+        syncBlockStartSortRoute();
+        if (
+            _blockStartSortInitialApplied ||
+            _blockStartSortManualOverride ||
+            _blockStartSortPending ||
+            _blockStartSortFailures >= 2
+        ) return;
+
+        const control = findBlockStartSortControl();
+        if (!control || _blockStartSortHandled.has(control)) return;
+
+        const rowOrder = getBlockStartRowOrder(control);
+        if (rowOrder.status === 'ascending') {
+            markBlockStartSortApplied(control, rowOrder.table);
+            return;
+        }
+
+        const state = getBlockStartSortState(control);
+        if (state === 'unknown') {
+            if (!_blockStartSortUnknown.has(control)) {
+                _blockStartSortUnknown.add(control);
+                console.warn('[Ufraa] Block Startのソート状態を判別できないため操作しません');
+            }
+            return;
+        }
+        // aria-sortだけがascendingで実行順が未描画/非昇順の場合も、循環クリックはしない。
+        if (state === 'ascending') return;
+        // 行がまだ描画されていない、または一行しかない場合は順序を推測してクリックしない。
+        if (rowOrder.status === 'insufficient') return;
+
+        // Cloudscapeの列ソートはクリックで循環する(未ソート→昇順→降順…等)。
+        // 実データが非昇順で、状態が確定している場合だけ安全上限内でクリックする。
+        _blockStartSortHandled.add(control);
+        _blockStartSortPending = true;
+        const appliedRoute = _blockStartSortRoute;
+        const appliedLifecycle = _blockStartSortLifecycle;
+
+        const finishPending = () => { _blockStartSortPending = false; };
+
+        const clickAndVerify = (clicks, prevState, activeControl) => {
+            if (clicks >= BLOCK_START_SORT_MAX_CLICKS || !isUsableSortControl(activeControl)) {
+                if (clicks >= BLOCK_START_SORT_MAX_CLICKS) {
+                    _blockStartSortFailures += 1;
+                    console.warn('[Ufraa] Block Startの昇順ソートを確認できませんでした');
+                }
+                finishPending();
+                return;
+            }
+
+            activeControl.click();
+            console.log(`[Ufraa] Block Startを昇順に設定 (変更前: ${prevState}, クリック ${clicks + 1})`);
+
+            setTimeout(() => {
+                syncBlockStartSortRoute();
+                // ルート/世代が変わっていれば、このライフサイクルの状態は書き換えない。
+                if (
+                    _blockStartSortRoute !== appliedRoute ||
+                    _blockStartSortLifecycle !== appliedLifecycle
+                ) return;
+                // 手動変更や別経路での完了を検知したら即中断。
+                if (_blockStartSortManualOverride || _blockStartSortInitialApplied) {
+                    finishPending();
+                    return;
+                }
+
+                const current = findBlockStartSortControl();
+                if (!current) {
+                    finishPending();
+                    return;
+                }
+                const currentOrder = getBlockStartRowOrder(current);
+                if (currentOrder.status === 'ascending') {
+                    markBlockStartSortApplied(current, currentOrder.table);
+                    finishPending();
+                    _blockStartSortHandled.delete(control);
+                    return;
+                }
+                const nextState = getBlockStartSortState(current);
+                // aria-sortだけがascendingでも、行が未描画/非昇順なら循環クリックしない。
+                if (
+                    currentOrder.status === 'insufficient' ||
+                    nextState === 'unknown' ||
+                    nextState === 'ascending'
+                ) {
+                    finishPending();
+                    return;
+                }
+                // 実行順が非昇順で、none/descendingを確認できた場合だけ次のクリックへ進む。
+                clickAndVerify(clicks + 1, nextState, current);
+            }, BLOCK_START_SORT_CONFIRM_MS);
+        };
+
+        clickAndVerify(0, state, control);
+    }
+
+    /** 初期成功直後の要素置換だけ、同一routeで一度だけ回復する。 */
+    function recoverBlockStartAscendingSort() {
+        syncBlockStartSortRoute();
+        if (
+            !_blockStartSortInitialApplied ||
+            _blockStartSortManualOverride ||
+            _blockStartSortPending ||
+            _blockStartSortRecoveries >= BLOCK_START_SORT_MAX_RECOVERIES ||
+            Date.now() > _blockStartSortStabilizeUntil
+        ) return;
+
+        const control = findBlockStartSortControl();
+        if (!control) return;
+        const rowOrder = getBlockStartRowOrder(control);
+        const wasReplaced =
+            control !== _blockStartSortAppliedControl ||
+            rowOrder.table !== _blockStartSortAppliedTable;
+        const state = getBlockStartSortState(control);
+        if (!wasReplaced || rowOrder.status !== 'not-ascending' || (state !== 'none' && state !== 'descending')) return;
+
+        _blockStartSortRecoveries += 1;
+        _blockStartSortInitialApplied = false;
+        _blockStartSortHandled = new WeakSet();
+        applyBlockStartAscendingSort();
+    }
+
+    function isSortControlClickTarget(target) {
+        if (!(target instanceof Element)) return false;
+        if (target.closest('[data-focus-id^="sorting-control-"]')) return true;
+
+        const button = target.closest('[role="button"]');
+        if (!button || !button.closest('th, [role="columnheader"]')) return false;
+        return Boolean(button.querySelector('[class*="sorting-icon_"]'));
+    }
+
+    /** SPA再描画とテーブルの遅延描画を監視する */
+    function startBlockStartSortFeature() {
+        if (_blockStartSortStarted || !document.body) return;
+        _blockStartSortStarted = true;
+
+        document.addEventListener('click', (event) => {
+            if (!event.isTrusted || !isSortControlClickTarget(event.target)) return;
+            syncBlockStartSortRoute();
+            _blockStartSortManualOverride = true;
+            _blockStartSortPending = false;
+            console.log('[Ufraa] 手動ソートを優先します');
+        }, true);
+
+        const observer = new MutationObserver(() => {
+            clearTimeout(observer._timeout);
+            observer._timeout = setTimeout(() => {
+                syncBlockStartSortRoute();
+                if (_blockStartSortInitialApplied) recoverBlockStartAscendingSort();
+                else applyBlockStartAscendingSort();
+            }, BLOCK_START_SORT_DEBOUNCE_MS);
+        });
+        observer.observe(document.body, {
+            childList: true,
+            subtree: true,
+            characterData: true,
+            attributes: true,
+            attributeFilter: ['aria-sort', 'class', 'd', 'data-focus-id']
+        });
+
+        applyBlockStartAscendingSort();
+        console.log('[Ufraa] Block Start昇順ソートを起動');
     }
 
     // --- CSV ---
@@ -529,8 +996,8 @@
     // 6. Live画面: Gap Check / SSDラベル / 行ハイライト
     // ===========================================================
 
-    // 選択中のSSD（ツールバーのドロップダウン）
-    let selectedSSD = 'ALL';
+    // 選択中のSSD（空文字は全件、CycleNameとは衝突しない）
+    let selectedSSD = '';
 
     // スクリプトが追加したラベル類（クラス名）
     const INJECTED_SELECTOR = '.ufraa-gap-label, .ufraa-ssd-label';
@@ -700,7 +1167,7 @@
             }
 
             // 選択したSSDに該当する行のSSDラベルを赤文字に
-            if (selectedSSD !== 'ALL' && ssdLabel === selectedSSD) {
+            if (selectedSSD && ssdLabel === selectedSSD) {
                 item._highlightSSD = true;
             }
 
@@ -776,6 +1243,218 @@
         }
     }
 
+    function fillCycleSelect(select, batchMode) {
+        const previous = select.value;
+        select.replaceChildren();
+
+        const allOption = document.createElement('option');
+        allOption.value = '';
+        allOption.textContent = batchMode ? '全SSD' : 'SSD: 全て';
+        select.appendChild(allOption);
+
+        for (const cycle of activeCycleDisplaySchedule()) {
+            const option = document.createElement('option');
+            option.value = cycle.label;
+            option.textContent = `${cycle.label} (${cycle.endTime})`;
+            select.appendChild(option);
+        }
+
+        const names = activeCycles().map((cycle) => cycle.name);
+        select.value = names.includes(previous) ? previous : '';
+    }
+
+    function refreshCycleOptions() {
+        const liveSelect = document.getElementById('ssd-filter-select');
+        if (liveSelect) {
+            fillCycleSelect(liveSelect, false);
+            selectedSSD = liveSelect.value;
+        } else if (!activeCycles().some((cycle) => cycle.name === selectedSSD)) {
+            selectedSSD = '';
+        }
+
+        const batchSelect = document.getElementById('ufraa-ssd-select');
+        if (batchSelect) fillCycleSelect(batchSelect, true);
+        runGapCheck();
+    }
+
+    function openCycleSettingsPanel() {
+        const existing = document.getElementById('ufraa-cycle-settings-overlay');
+        if (existing) return;
+
+        const draft = JSON.parse(JSON.stringify(activeCycleSettings));
+        const overlay = document.createElement('div');
+        overlay.id = 'ufraa-cycle-settings-overlay';
+        overlay.style.cssText =
+            'position:fixed;inset:0;z-index:2147483647;background:rgba(0,0,0,.35);' +
+            'display:flex;align-items:center;justify-content:center;padding:20px;';
+
+        const panel = document.createElement('div');
+        panel.style.cssText =
+            'width:560px;max-width:calc(100vw - 40px);max-height:calc(100vh - 40px);overflow:auto;' +
+            'background:#fff;border:1px solid #aaa;border-radius:6px;box-shadow:0 4px 16px rgba(0,0,0,.3);' +
+            'padding:16px;font-family:Arial,sans-serif;color:#16191f;';
+
+        const header = document.createElement('div');
+        header.style.cssText = 'display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;';
+        const title = document.createElement('strong');
+        title.textContent = 'Cycle設定';
+        title.style.fontSize = '16px';
+        const closeBtn = document.createElement('button');
+        closeBtn.type = 'button';
+        closeBtn.textContent = '×';
+        closeBtn.title = '閉じる';
+        closeBtn.style.cssText =
+            'border:none;background:transparent;color:#555;font-size:24px;line-height:24px;cursor:pointer;padding:0 4px;';
+        header.appendChild(title);
+        header.appendChild(closeBtn);
+
+        const modeRow = document.createElement('label');
+        modeRow.style.cssText = 'display:flex;align-items:center;gap:8px;font-size:13px;margin-bottom:12px;';
+        const modeText = document.createElement('span');
+        modeText.textContent = 'Cycle数';
+        modeText.style.fontWeight = 'bold';
+        const modeSelect = document.createElement('select');
+        modeSelect.style.cssText =
+            'height:32px;padding:4px 8px;border:1px solid #aaa;border-radius:4px;font-size:13px;';
+        for (const count of [6, 8]) {
+            const option = document.createElement('option');
+            option.value = String(count);
+            option.textContent = `${count} Cycle`;
+            modeSelect.appendChild(option);
+        }
+        modeSelect.value = String(draft.selectedCycleCount);
+        modeRow.appendChild(modeText);
+        modeRow.appendChild(modeSelect);
+
+        const columnHeader = document.createElement('div');
+        columnHeader.style.cssText =
+            'display:grid;grid-template-columns:36px 1fr 140px;gap:8px;margin-bottom:4px;' +
+            'font-size:11px;font-weight:bold;color:#555;';
+        for (const text of ['No.', 'CycleName', '終了時刻 (HH:MM)']) {
+            const span = document.createElement('span');
+            span.textContent = text;
+            columnHeader.appendChild(span);
+        }
+
+        const rows = document.createElement('div');
+        const error = document.createElement('div');
+        error.style.cssText = 'min-height:18px;margin-top:8px;color:#d13212;font-size:12px;font-weight:bold;';
+
+        const renderRows = () => {
+            rows.replaceChildren();
+            const count = draft.selectedCycleCount;
+            draft.configs[String(count)].cycles.forEach((cycle, index) => {
+                const row = document.createElement('div');
+                row.style.cssText =
+                    'display:grid;grid-template-columns:36px 1fr 140px;gap:8px;align-items:center;margin-bottom:6px;';
+                const number = document.createElement('span');
+                number.textContent = String(index + 1);
+                number.style.cssText = 'font-size:12px;color:#555;text-align:center;';
+                const nameInput = document.createElement('input');
+                nameInput.type = 'text';
+                nameInput.value = cycle.name;
+                nameInput.style.cssText =
+                    'height:32px;padding:4px 8px;border:1px solid #aaa;border-radius:4px;font-size:13px;box-sizing:border-box;';
+                const timeInput = document.createElement('input');
+                timeInput.type = 'time';
+                timeInput.step = '60';
+                timeInput.value = cycle.endTime;
+                timeInput.style.cssText =
+                    'height:32px;padding:4px 8px;border:1px solid #aaa;border-radius:4px;font-size:13px;box-sizing:border-box;';
+                nameInput.addEventListener('input', () => { cycle.name = nameInput.value; });
+                timeInput.addEventListener('input', () => { cycle.endTime = timeInput.value; });
+                row.appendChild(number);
+                row.appendChild(nameInput);
+                row.appendChild(timeInput);
+                rows.appendChild(row);
+            });
+        };
+
+        modeSelect.addEventListener('change', () => {
+            draft.selectedCycleCount = Number(modeSelect.value);
+            error.textContent = '';
+            renderRows();
+        });
+
+        const actions = document.createElement('div');
+        actions.style.cssText = 'display:flex;justify-content:flex-end;gap:8px;margin-top:8px;';
+        const cancelBtn = document.createElement('button');
+        cancelBtn.type = 'button';
+        cancelBtn.textContent = 'キャンセル';
+        cancelBtn.style.cssText =
+            'height:32px;padding:0 14px;background:#fff;color:#0073bb;border:1px solid #0073bb;' +
+            'border-radius:4px;cursor:pointer;font-size:13px;font-weight:bold;';
+        const saveBtn = document.createElement('button');
+        saveBtn.type = 'button';
+        saveBtn.textContent = '保存';
+        saveBtn.style.cssText =
+            'height:32px;padding:0 16px;background:#0073bb;color:#fff;border:none;border-radius:4px;' +
+            'cursor:pointer;font-size:13px;font-weight:bold;';
+        actions.appendChild(cancelBtn);
+        actions.appendChild(saveBtn);
+
+        const close = () => overlay.remove();
+        closeBtn.addEventListener('click', close);
+        cancelBtn.addEventListener('click', close);
+        saveBtn.addEventListener('click', () => {
+            error.textContent = '';
+            const result = validateCycleSettings(draft);
+            if (!result.ok) {
+                error.textContent = result.message;
+                return;
+            }
+            try {
+                localStorage.setItem(LS_CYCLE_SETTINGS, JSON.stringify(result.settings));
+            } catch (e) {
+                error.textContent = '設定を保存できませんでした。ブラウザの保存領域を確認してください。';
+                return;
+            }
+            activeCycleSettings = result.settings;
+            close();
+            refreshCycleOptions();
+        });
+
+        panel.appendChild(header);
+        panel.appendChild(modeRow);
+        panel.appendChild(columnHeader);
+        panel.appendChild(rows);
+        panel.appendChild(error);
+        panel.appendChild(actions);
+        overlay.appendChild(panel);
+        document.body.appendChild(overlay);
+        renderRows();
+    }
+
+    function makeCycleSettingsButton(id) {
+        const btn = document.createElement('button');
+        btn.id = id;
+        btn.type = 'button';
+        btn.textContent = '⚙';
+        btn.title = 'Cycle設定';
+        btn.setAttribute('aria-label', 'Cycle設定');
+        btn.style.cssText =
+            'padding:0 10px;background:#f2f3f3;color:#687078;border:1px solid #aab7b8;border-radius:4px;cursor:pointer;' +
+            'font-size:18px;font-weight:bold;height:32px;line-height:30px;';
+        btn.addEventListener('mouseover', () => (btn.style.background = '#e7e9ec'));
+        btn.addEventListener('mouseout', () => (btn.style.background = '#f2f3f3'));
+        btn.addEventListener('click', openCycleSettingsPanel);
+        return btn;
+    }
+
+    function createCycleSettingsButton() {
+        if (document.getElementById('ufraa-cycle-settings-btn')) return;
+        const alignRight = toolbarAlignRight();
+        if (!alignRight) return;
+        const btn = makeCycleSettingsButton('ufraa-cycle-settings-btn');
+        btn.style.marginRight = '8px';
+        const csvButton = document.getElementById('csv-export-btn');
+        if (csvButton && csvButton.parentElement === alignRight) {
+            csvButton.insertAdjacentElement('afterend', btn);
+        } else {
+            insertBeforePrefs(alignRight, btn);
+        }
+    }
+
     function createSSDDropdown() {
         if (document.getElementById('ssd-filter-select')) return;
         const alignRight = toolbarAlignRight();
@@ -794,19 +1473,8 @@
             cursor: pointer;
         `;
 
-        const allOption = document.createElement('option');
-        allOption.value = 'ALL';
-        allOption.textContent = 'SSD: 全て';
-        select.appendChild(allOption);
-
-        SSD_FILTERS.forEach((f) => {
-            const option = document.createElement('option');
-            option.value = f.label;
-            option.textContent = f.label;
-            select.appendChild(option);
-        });
-
-        select.value = selectedSSD;
+        fillCycleSelect(select, false);
+        select.value = activeCycles().some((cycle) => cycle.name === selectedSSD) ? selectedSSD : '';
         select.addEventListener('change', () => {
             selectedSSD = select.value;
             runGapCheck();
@@ -909,6 +1577,7 @@
     function ensureLiveUi() {
         createSSDDropdown();
         createCSVButton();
+        createCycleSettingsButton();
         createPrefsButton();
     }
 
@@ -1156,7 +1825,7 @@
 
     /** SSDごとの package総数 / route数 と Block Lengthごとの内訳 */
     function calculateSPR(rows, pkgColIdx, blockLengthColIdx) {
-        const ssdMap = {};
+        const ssdMap = Object.create(null);
 
         for (const row of rows) {
             const ssd = row[0] || 'Unknown';
@@ -1196,6 +1865,11 @@
         return result;
     }
 
+    function escapeHtml(value) {
+        const escapes = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+        return String(value).replace(/[&<>"']/g, (character) => escapes[character]);
+    }
+
     function displaySPR(sprData) {
         let container = document.getElementById('ufraa-spr-display');
         if (!container) {
@@ -1232,7 +1906,7 @@
 
         for (const d of sprData) {
             html += '<tr style="border-bottom:1px solid #ddd;">';
-            html += `<td style="padding:3px 6px;font-weight:bold;">${d.ssd}</td>`;
+            html += `<td style="padding:3px 6px;font-weight:bold;">${escapeHtml(d.ssd)}</td>`;
             html += `<td style="padding:3px 6px;text-align:right">${d.totalRoutes}</td>`;
             html += `<td style="padding:3px 6px;text-align:right">${d.totalPkg}</td>`;
             for (const bl of BLOCK_LENGTHS) {
@@ -1348,7 +2022,8 @@
 
     /** SSDラベル（nullなら全件）→ "HH:MM" のリスト */
     function ssdTimesForLabels(labels) {
-        const targets = labels ? SSD_SCHEDULE.filter((s) => labels.includes(s.label)) : SSD_SCHEDULE;
+        const schedule = activeCycleQuerySchedule();
+        const targets = labels ? schedule.filter((s) => labels.includes(s.label)) : schedule;
         return targets.map((s) => `${p2(s.jstHour)}:${p2(s.jstMin)}`);
     }
 
@@ -1498,16 +2173,7 @@
         const select = document.createElement('select');
         select.id = 'ufraa-ssd-select';
         select.style.cssText = 'padding:4px 6px;border:1px solid #aaa;border-radius:4px;font-size:13px;height:32px;';
-        const allOpt = document.createElement('option');
-        allOpt.value = 'ALL';
-        allOpt.textContent = '全SSD';
-        select.appendChild(allOpt);
-        SSD_SCHEDULE.forEach((s) => {
-            const opt = document.createElement('option');
-            opt.value = s.label;
-            opt.textContent = `${s.label} (${p2(s.jstHour)}:${p2(s.jstMin)})`;
-            select.appendChild(opt);
-        });
+        fillCycleSelect(select, true);
 
         // 実行ボタン
         const runBtn = document.createElement('button');
@@ -1518,6 +2184,8 @@
             'font-size:13px;font-weight:bold;height:32px;line-height:32px;';
         runBtn.addEventListener('mouseover', () => (runBtn.style.background = '#005a8c'));
         runBtn.addEventListener('mouseout', () => (runBtn.style.background = '#0073bb'));
+
+        const cycleSettingsBtn = makeCycleSettingsButton('ufraa-batch-cycle-settings-btn');
 
         // ステータス
         const statusSpan = document.createElement('span');
@@ -1533,7 +2201,7 @@
             if (!dateFrom || !dateTo) { statusSpan.textContent = '日付を選択してください。'; return; }
             if (dateFrom > dateTo) { statusSpan.textContent = 'From日付がTo日付より後です。'; return; }
 
-            const labels = select.value === 'ALL' ? null : [select.value];
+            const labels = select.value ? [select.value] : null;
 
             // 日付範囲から全日付リストを生成
             const dates = [];
@@ -1564,6 +2232,7 @@
         panel.appendChild(dateToInput);
         panel.appendChild(select);
         panel.appendChild(runBtn);
+        panel.appendChild(cycleSettingsBtn);
         panel.appendChild(statusSpan);
 
         toolsRow.style.display = 'flex';
@@ -1608,6 +2277,11 @@
 
     function tick() {
         if (!document.body) return;
+
+        startBlockStartSortFeature();
+        if (!_blockStartSortInitialApplied && !_blockStartSortPending) {
+            applyBlockStartAscendingSort();
+        }
 
         if (isLivePage()) {
             startLiveFeatures();
