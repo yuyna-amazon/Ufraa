@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ufraa
 // @namespace    https://github.com/yuyna-amazon/Ufraa
-// @version      3.9
+// @version      4.3
 // @description  Ufraa Assignment Plan: Route Duration乖離表示 + SSDラベル + CSV出力 / Service AreasからSSD時間帯を一括巡回してCSV出力
 // @author       yuyna
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=amazon.com
@@ -10,10 +10,15 @@
 // @downloadURL  https://raw.githubusercontent.com/yuyna-amazon/Ufraa/main/Ufraa.user.js
 // @grant        none
 // @run-at       document-start
+// @noframes
 // ==/UserScript==
 
 (function () {
     'use strict';
+
+    if (window.top !== window.self) return;
+    if (document.documentElement.dataset.ufraaV43Started === 'true') return;
+    document.documentElement.dataset.ufraaV43Started = 'true';
 
     // ===========================================================
     // 1. 共通定義 / ページ判定
@@ -1916,11 +1921,26 @@
         return null;
     }
 
+    function parseBlockLengthMinutes(value) {
+        const text = String(value || '').trim();
+        const direct = parseDurationToMinutes(text);
+        if (direct !== null) return direct;
+
+        // SSD Route PlanのMatched Blockは "FLEX, 2h 29m" のように種別を含む
+        const duration = text.match(/\d+\s*h(?:r|rs|ours?)?(?:\s*\d+\s*m(?:in|ins|inutes?)?)?/i);
+        return duration ? parseDurationToMinutes(duration[0]) : null;
+    }
+
     /** SSDごとの package総数 / route数 と Block Lengthごとの内訳 */
-    function calculateSPR(rows, pkgColIdx, blockLengthColIdx) {
+    function calculateSPR(rows, pkgColIdx, blockLengthColIdx, excludeRowsWithoutBlockLength = false) {
         const ssdMap = Object.create(null);
 
         for (const row of rows) {
+            const blockLengthLabel = blockLengthColIdx >= 0
+                ? minutesToBlockLabel(parseBlockLengthMinutes((row[blockLengthColIdx] || '').trim()))
+                : null;
+            if (excludeRowsWithoutBlockLength && !blockLengthLabel) continue;
+
             const ssd = row[0] || 'Unknown';
             if (!ssdMap[ssd]) {
                 ssdMap[ssd] = { totalPkg: 0, totalRoutes: 0, byBlock: {} };
@@ -1935,12 +1955,9 @@
                 ssdMap[ssd].totalPkg += pkgVal;
             }
 
-            if (blockLengthColIdx >= 0) {
-                const blLabel = minutesToBlockLabel(parseDurationToMinutes((row[blockLengthColIdx] || '').trim()));
-                if (blLabel && ssdMap[ssd].byBlock[blLabel] !== undefined) {
-                    ssdMap[ssd].byBlock[blLabel].pkg += pkgVal;
-                    ssdMap[ssd].byBlock[blLabel].routes += 1;
-                }
+            if (blockLengthLabel && ssdMap[ssd].byBlock[blockLengthLabel] !== undefined) {
+                ssdMap[ssd].byBlock[blockLengthLabel].pkg += pkgVal;
+                ssdMap[ssd].byBlock[blockLengthLabel].routes += 1;
             }
         }
 
@@ -2111,7 +2128,7 @@
     }
 
     /** SSD Route PlanのCurrent SSD Planned Routesを直接結合してCSV出力 */
-    function exportSsdRouteCsv() {
+    function exportSsdRouteCsv(anchorPanel) {
         const store = readSsdRouteCollect();
         const entries = Object.keys(store)
             .map((key) => store[key])
@@ -2141,6 +2158,8 @@
             const byDateTime = `${a[1]}${a[2]}`.localeCompare(`${b[1]}${b[2]}`);
             return byDateTime || (a[3] || '').localeCompare(b[3] || '');
         });
+
+        displaySPR(calculateSPR(rows, 7, 15, true), anchorPanel);
 
         const sa = serviceAreaId() || 'sa';
         downloadText(arrToCsv(headers, rows), `ssd_route_batch_${sa.slice(0, 8)}_${stampNow()}.csv`);
@@ -2305,7 +2324,7 @@
             clearInterval(progressInterval);
             const collected = mode === 'ssdRoute' ? readSsdRouteCollect() : readCollect();
             const count = Object.keys(collected).length;
-            const rowCount = mode === 'ssdRoute' ? exportSsdRouteCsv() : exportCombinedCsv(sourcePanel);
+            const rowCount = mode === 'ssdRoute' ? exportSsdRouteCsv(sourcePanel) : exportCombinedCsv(sourcePanel);
             statusEl.textContent =
                 rowCount > 0
                     ? `✅ 完了！ ${count}時刻 / 計${rowCount}行をCSV保存しました。`
@@ -2333,7 +2352,15 @@
     function injectPanelForSection(sectionTitle, suffix) {
         const idSuffix = suffix ? `-${suffix}` : '';
         const panelId = `ufraa-ssd-panel${idSuffix}`;
-        if (document.getElementById(panelId)) return;
+        const cycleSettingsButtonId = `ufraa-batch-cycle-settings-btn${idSuffix}`;
+        const existingPanel = document.getElementById(panelId);
+        if (existingPanel) {
+            if (!document.getElementById(cycleSettingsButtonId)) {
+                existingPanel.appendChild(makeCycleSettingsButton(cycleSettingsButtonId));
+                console.log(`[Ufraa v4.3] ${sectionTitle}のCycle設定ボタンを補完`);
+            }
+            return;
+        }
 
         const toolsFiltering = findSectionToolsFiltering(sectionTitle);
         if (!toolsFiltering) return;
@@ -2386,7 +2413,7 @@
         runBtn.addEventListener('mouseover', () => (runBtn.style.background = '#005a8c'));
         runBtn.addEventListener('mouseout', () => (runBtn.style.background = '#0073bb'));
 
-        const cycleSettingsBtn = makeCycleSettingsButton(`ufraa-batch-cycle-settings-btn${idSuffix}`);
+        const cycleSettingsBtn = makeCycleSettingsButton(cycleSettingsButtonId);
 
         // ステータス
         const statusSpan = document.createElement('span');
@@ -2505,5 +2532,5 @@
     if (document.readyState !== 'loading') tick();
     document.addEventListener('DOMContentLoaded', tick);
 
-    console.log('[Ufraa] 起動 (Assignment Plan + SSD Batch CSV)');
+    console.log('[Ufraa v4.3] 起動 (Assignment Plan + SSD Batch CSV)');
 })();
