@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ufraa
 // @namespace    https://github.com/yuyna-amazon/Ufraa
-// @version      3.6
+// @version      3.9
 // @description  Ufraa Assignment Plan: Route Duration乖離表示 + SSDラベル + CSV出力 / Service AreasからSSD時間帯を一括巡回してCSV出力
 // @author       yuyna
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=amazon.com
@@ -84,6 +84,22 @@
         'Block Length'
     ];
 
+    const SSD_ROUTE_CSV_COLUMNS = [
+        'Route Code',
+        'Route ID',
+        'Status',
+        'Route Tags',
+        'Packages',
+        'Route Duration Without Inbound Stem',
+        'Inbound Stem Duration',
+        'Outbound Stem Duration',
+        'Under The Roof Duration',
+        'Route Promise Time',
+        'Dispatch Window Start',
+        'Dispatch Window End',
+        'Matched Block'
+    ];
+
     // Live画面のFilter入力欄に自動入力する文字列
     const FILTER_TEXT = 'Open,Waiting,Unknown';
 
@@ -100,9 +116,16 @@
     const SERVICE = 'execute-api';
     const EMPTY_SHA256 = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
     const INPUT_TYPE = 'FLEX_ROUTE_ASSIGNMENT_PLANNER_INPUT';
+    const SSD_ROUTE_PLAN_TYPES = [
+        'FLEX_SSD_ROUTE_PLAN',
+        'SSD_ROUTE_PLAN',
+        'FLEX_SSD_ROUTING_PLAN',
+        'SSD_ROUTING_PLAN'
+    ];
 
     // localStorageキー
     const LS_COLLECT = 'ufraaSsdCollected';
+    const LS_SSD_ROUTE_COLLECT = 'ufraaSsdRouteCollected';
     const LS_QUEUE = 'ufraaSsdWorkerQueue';
     const LS_CYCLE_SETTINGS = 'ufraaCycleSettings_v1';
 
@@ -121,6 +144,12 @@
         if (!m) return null;
         const id = decodeURIComponent(m[1]);
         return id === 'live' || id.startsWith('live/') ? null : id;
+    }
+
+    /** /ssd-route-page/<artifactId> のartifactIdを返す */
+    function ssdRoutePlanIdFromPath() {
+        const m = /^\/ssd-route-page\/(.+)$/.exec(location.pathname);
+        return m ? decodeURIComponent(m[1]) : null;
     }
 
     /** Assignment Plan Live画面か */
@@ -282,13 +311,13 @@
     }
 
     /** 1時間刻みでartifact-metadataを取得して重複排除 */
-    async function fetchInputMeta(sa, startSec, endSec) {
+    async function fetchArtifactMeta(sa, startSec, endSec, artifactType) {
         let all = [];
         for (let t = startSec; t < endSec; t += 3600) {
             const to = Math.min(t + 3600, endSec);
             const j = await apiGetJson('/prod/artifact-metadata', {
                 scope: sa,
-                artifactType: INPUT_TYPE,
+                artifactType,
                 startTime: String(t),
                 endTime: String(to)
             });
@@ -301,6 +330,19 @@
         }
         list.sort((a, b) => (a.creationTime < b.creationTime ? -1 : 1));
         return list;
+    }
+
+    async function fetchInputMeta(sa, startSec, endSec) {
+        return fetchArtifactMeta(sa, startSec, endSec, INPUT_TYPE);
+    }
+
+    /** 環境差を考慮し、利用可能なSSD Route Planのartifact種別を順に試す */
+    async function fetchSsdRoutePlanMeta(sa, startSec, endSec) {
+        for (const artifactType of SSD_ROUTE_PLAN_TYPES) {
+            const list = await fetchArtifactMeta(sa, startSec, endSec, artifactType);
+            if (list.length) return list;
+        }
+        return [];
     }
 
     // ===========================================================
@@ -1279,8 +1321,9 @@
             selectedSSD = '';
         }
 
-        const batchSelect = document.getElementById('ufraa-ssd-select');
-        if (batchSelect) fillCycleSelect(batchSelect, true);
+        document.querySelectorAll('[data-ufraa-batch-cycle-select]').forEach((batchSelect) => {
+            fillCycleSelect(batchSelect, true);
+        });
         runGapCheck();
     }
 
@@ -1638,6 +1681,8 @@
 
     function readCollect() { return loadJson(LS_COLLECT) || {}; }
     function writeCollect(o) { try { localStorage.setItem(LS_COLLECT, JSON.stringify(o)); } catch (e) {} }
+    function readSsdRouteCollect() { return loadJson(LS_SSD_ROUTE_COLLECT) || {}; }
+    function writeSsdRouteCollect(o) { try { localStorage.setItem(LS_SSD_ROUTE_COLLECT, JSON.stringify(o)); } catch (e) {} }
 
     /** AWS UIのheader-cell/body-cellクラスからテーブルを読み取る */
     function scrapeTable() {
@@ -1701,9 +1746,7 @@
 
         // キューが存在し巡回中の場合のみ処理
         const q = loadJson(LS_QUEUE);
-        if (!q || !q.active) return;
-
-        // 最初のページでカラム設定を自動適用（設定は保持されるので1回だけ）
+        if (!q || !q.active || q.mode === 'ssdRoute') return;
         if (!q.prefsApplied) {
             if (_prefsRunning) return;
             _prefsRunning = true;
@@ -1744,38 +1787,14 @@
         doCollect(id);
     }
 
-    function doCollect(id) {
-        const jt = jstFromArtifactId(id);
-        const ssdLabel = ssdLabelFromJstTime(jt.time);
-        const t = scrapeTable();
-        const cnt = t ? t.count : 0;
-
-        if (cnt) {
-            const store = readCollect();
-            if (!store[id] || store[id].count !== cnt) {
-                store[id] = {
-                    date: jt.date,
-                    time: jt.time,
-                    ssd: ssdLabel,
-                    headers: t.headers,
-                    rows: t.rows,
-                    count: cnt,
-                    ts: Date.now()
-                };
-                writeCollect(store);
-            }
-            showBadge(`🗂 収集済: ${ssdLabel} ${jt.time} / ${cnt}行`, '#1f7a3d');
-        } else {
-            showBadge(`🗂 表を読込中... ${ssdLabel} ${jt.time}`, '#8a6d00');
-        }
-
-        // 巡回制御
+    function advanceWorker(id, table) {
         if (_wAdv) return;
 
+        const cnt = table ? table.count : 0;
         if (id !== _wId) { _wId = id; _wCount = -1; _wStable = 0; _wStart = Date.now(); }
 
         // 行数が安定し、かつ行のカラム数が十分あることを確認
-        const colCount = t && t.rows.length > 0 ? t.rows[0].length : 0;
+        const colCount = table && table.rows.length > 0 ? table.rows[0].length : 0;
         const stableCheck = cnt > 0 && cnt === _wCount && colCount > 3;
         if (stableCheck) _wStable += 1; else _wStable = 0;
         _wCount = cnt;
@@ -1803,6 +1822,73 @@
             showBadge('✅ 全SSD収集完了！タブを閉じます...', '#1f7a3d');
             setTimeout(() => { try { window.close(); } catch (e) {} }, 2000);
         }
+    }
+
+    function doCollect(id) {
+        const jt = jstFromArtifactId(id);
+        const ssdLabel = ssdLabelFromJstTime(jt.time);
+        const t = scrapeTable();
+        const cnt = t ? t.count : 0;
+
+        if (cnt) {
+            const store = readCollect();
+            if (!store[id] || store[id].count !== cnt) {
+                store[id] = {
+                    date: jt.date,
+                    time: jt.time,
+                    ssd: ssdLabel,
+                    headers: t.headers,
+                    rows: t.rows,
+                    count: cnt,
+                    ts: Date.now()
+                };
+                writeCollect(store);
+            }
+            showBadge(`🗂 収集済: ${ssdLabel} ${jt.time} / ${cnt}行`, '#1f7a3d');
+        } else {
+            showBadge(`🗂 表を読込中... ${ssdLabel} ${jt.time}`, '#8a6d00');
+        }
+
+        advanceWorker(id, t);
+    }
+
+    function collectSsdRoutePage() {
+        const id = ssdRoutePlanIdFromPath();
+        if (!id) return;
+
+        const q = loadJson(LS_QUEUE);
+        if (!q || !q.active || q.mode !== 'ssdRoute') return;
+
+        const t = scrapeTable();
+        const cnt = t ? t.count : 0;
+        if (cnt) {
+            const item = Array.isArray(q.items) ? q.items[q.idx || 0] : null;
+            const store = readSsdRouteCollect();
+            if (!store[id] || store[id].count !== cnt) {
+                store[id] = {
+                    date: item?.date || '',
+                    time: item?.time || '',
+                    ssd: item?.ssd || '',
+                    headers: t.headers,
+                    rows: t.rows,
+                    count: cnt,
+                    ts: Date.now()
+                };
+                writeSsdRouteCollect(store);
+            }
+
+            const matchedBlockColIdx = t.headers.findIndex(
+                (header) => header.trim().toLowerCase() === 'matched block'
+            );
+            const matchedCount = matchedBlockColIdx >= 0
+                ? t.rows.filter((row) => (row[matchedBlockColIdx] || '').trim()).length
+                : 0;
+            showBadge(`🧩 SSD Route Plan収集済: ${cnt}行 / Matched Block ${matchedCount}行`, '#1f7a3d');
+        } else {
+            showBadge('🧩 SSD Route Plan表を読込中...', '#8a6d00');
+        }
+
+        advanceWorker(id, t);
     }
 
     // ===========================================================
@@ -1877,15 +1963,16 @@
         return String(value).replace(/[&<>"']/g, (character) => escapes[character]);
     }
 
-    function displaySPR(sprData) {
-        let container = document.getElementById('ufraa-spr-display');
+    function displaySPR(sprData, anchorPanel) {
+        const displayId = anchorPanel?.id ? `${anchorPanel.id}-spr-display` : 'ufraa-spr-display';
+        let container = document.getElementById(displayId);
         if (!container) {
             container = document.createElement('div');
-            container.id = 'ufraa-spr-display';
+            container.id = displayId;
             container.style.cssText =
                 'margin-top:8px;padding:10px;background:#f0f7ff;border:1px solid #0073bb;border-radius:6px;font-size:12px;';
 
-            const panel = document.getElementById('ufraa-ssd-panel');
+            const panel = anchorPanel || document.getElementById('ufraa-ssd-panel');
             if (panel && panel.parentElement) {
                 panel.parentElement.insertAdjacentElement('afterend', container);
             } else {
@@ -1942,7 +2029,7 @@
     // 10. Batch: 収集データの結合CSV出力
     // ===========================================================
 
-    function exportCombinedCsv() {
+    function exportCombinedCsv(anchorPanel) {
         const store = readCollect();
         const entries = Object.keys(store)
             .map((k) => store[k])
@@ -2016,10 +2103,47 @@
             rows.sort((a, b) => (a[blockStartColIdx] || '').trim().localeCompare((b[blockStartColIdx] || '').trim()));
         }
 
-        displaySPR(calculateSPR(rows, pkgColIdx, blColIdx));
+        displaySPR(calculateSPR(rows, pkgColIdx, blColIdx), anchorPanel);
 
         const sa = serviceAreaId() || 'sa';
         downloadText(arrToCsv(headers, rows), `ssd_batch_${sa.slice(0, 8)}_${stampNow()}.csv`);
+        return rows.length;
+    }
+
+    /** SSD Route PlanのCurrent SSD Planned Routesを直接結合してCSV出力 */
+    function exportSsdRouteCsv() {
+        const store = readSsdRouteCollect();
+        const entries = Object.keys(store)
+            .map((key) => store[key])
+            .sort((a, b) => `${a.date}${a.time}`.localeCompare(`${b.date}${b.time}`));
+        if (!entries.length) return 0;
+
+        const headers = ['SSD', '日付(JST)', '時刻(JST)'].concat(SSD_ROUTE_CSV_COLUMNS);
+        const rows = [];
+
+        for (const entry of entries) {
+            const indexes = SSD_ROUTE_CSV_COLUMNS.map((column) =>
+                entry.headers.findIndex((header) => header.trim().toLowerCase() === column.toLowerCase())
+            );
+            for (const sourceRow of entry.rows || []) {
+                rows.push([
+                    entry.ssd || '',
+                    entry.date || '',
+                    entry.time || '',
+                    ...indexes.map((index) => (index >= 0 ? sourceRow[index] || '' : ''))
+                ]);
+            }
+        }
+
+        if (!rows.length) return 0;
+
+        rows.sort((a, b) => {
+            const byDateTime = `${a[1]}${a[2]}`.localeCompare(`${b[1]}${b[2]}`);
+            return byDateTime || (a[3] || '').localeCompare(b[3] || '');
+        });
+
+        const sa = serviceAreaId() || 'sa';
+        downloadText(arrToCsv(headers, rows), `ssd_route_batch_${sa.slice(0, 8)}_${stampNow()}.csv`);
         return rows.length;
     }
 
@@ -2061,38 +2185,101 @@
         });
     }
 
+    /** artifact-metadata APIから各SSD時刻に最も近いSSD Route Planを解決 */
+    async function resolveSsdRouteUrls(sa, dateStr, times) {
+        const targets = times
+            .map((t) => ({ t, ms: Date.parse(`${dateStr}T${t}:00+09:00`) }))
+            .filter((x) => !Number.isNaN(x.ms));
+        if (!targets.length) return [];
+
+        const startSec = Math.floor(Math.min(...targets.map((x) => x.ms)) / 1000) - 1800;
+        const endSec = Math.floor(Math.max(...targets.map((x) => x.ms)) / 1000) + 1800;
+        const list = await fetchSsdRoutePlanMeta(sa, startSec, endSec);
+        const withMs = list.map((a) => ({ ms: Date.parse(a.creationTime) || 0, id: a.artifactId }));
+
+        return targets.map((tg) => {
+            let best = null;
+            let bd = Infinity;
+            for (const a of withMs) {
+                const d = Math.abs(a.ms - tg.ms);
+                if (d < bd) { bd = d; best = a; }
+            }
+            return {
+                time: tg.t,
+                id: best ? best.id : null,
+                url: best ? `${location.origin}/ssd-route-page/${encodeURIComponent(best.id)}` : null
+            };
+        });
+    }
+
     /** 複数日付×SSD時刻を作業タブで巡回し、完了後に結合CSVを出力 */
     async function runBatchExport(sa, dates, ssdLabels, statusEl) {
-        console.log('[Ufraa] runBatchExport:', sa, dates, ssdLabels);
+        const sourcePanel = statusEl.closest('[data-ufraa-batch-panel]');
+        const mode = sourcePanel?.dataset.ufraaBatchPanel === 'SSD Route Plans' ? 'ssdRoute' : 'assignment';
+        console.log('[Ufraa] runBatchExport:', sa, dates, ssdLabels, { mode });
         if (!AUTH.creds || !AUTH.midway) {
             statusEl.textContent = '⏳ 認証が未取得です。ページをリロードしてください。';
             return;
         }
-        statusEl.textContent = 'planner-inputを検索中...';
 
         const times = ssdTimesForLabels(ssdLabels);
-        let allUrls = [];
+        let items = [];
 
         for (let i = 0; i < dates.length; i++) {
-            statusEl.textContent = `planner-input検索中... (${i + 1}/${dates.length}日)`;
-            try {
-                const resolved = await resolveUrls(sa, dates[i], times);
-                allUrls = allUrls.concat(resolved.filter((r) => r.url).map((r) => r.url));
-            } catch (e) {
-                console.warn('[Ufraa] resolve error for', dates[i], e);
+            if (mode === 'ssdRoute') {
+                statusEl.textContent = `SSD Route Plan検索中... (${i + 1}/${dates.length}日)`;
+                try {
+                    const resolved = await resolveSsdRouteUrls(sa, dates[i], times);
+                    items = items.concat(
+                        resolved
+                            .filter((result) => result.url)
+                            .map((result) => ({
+                                url: result.url,
+                                date: dates[i],
+                                time: result.time,
+                                ssd: ssdLabelFromJstTime(result.time)
+                            }))
+                    );
+                } catch (e) {
+                    console.warn('[Ufraa] SSD Route Plan resolve error for', dates[i], e);
+                }
+            } else {
+                statusEl.textContent = `planner-input検索中... (${i + 1}/${dates.length}日)`;
+                try {
+                    const resolved = await resolveUrls(sa, dates[i], times);
+                    items = items.concat(
+                        resolved.filter((result) => result.url).map((result) => ({ url: result.url }))
+                    );
+                } catch (e) {
+                    console.warn('[Ufraa] resolve error for', dates[i], e);
+                }
             }
         }
 
-        if (!allUrls.length) {
-            statusEl.textContent = '該当するAssignment Planが見つかりませんでした。';
+        items = [...new Map(items.map((item) => [item.url, item])).values()];
+        if (!items.length) {
+            statusEl.textContent = mode === 'ssdRoute'
+                ? '該当するSSD Route Planが見つかりませんでした。'
+                : '該当するAssignment Planが見つかりませんでした。';
             return;
         }
 
+        const allUrls = items.map((item) => item.url);
+
         // 収集ストアをクリアしてキューを設定
-        writeCollect({});
+        if (mode === 'ssdRoute') writeSsdRouteCollect({});
+        else writeCollect({});
         localStorage.setItem(
             LS_QUEUE,
-            JSON.stringify({ urls: allUrls, idx: 0, active: true, total: allUrls.length, ts: Date.now() })
+            JSON.stringify({
+                urls: allUrls,
+                items,
+                idx: 0,
+                active: true,
+                total: allUrls.length,
+                mode,
+                ts: Date.now()
+            })
         );
 
         // 作業タブを開く
@@ -2116,8 +2303,9 @@
             }
 
             clearInterval(progressInterval);
-            const count = Object.keys(readCollect()).length;
-            const rowCount = exportCombinedCsv();
+            const collected = mode === 'ssdRoute' ? readSsdRouteCollect() : readCollect();
+            const count = Object.keys(collected).length;
+            const rowCount = mode === 'ssdRoute' ? exportSsdRouteCsv() : exportCombinedCsv(sourcePanel);
             statusEl.textContent =
                 rowCount > 0
                     ? `✅ 完了！ ${count}時刻 / 計${rowCount}行をCSV保存しました。`
@@ -2130,32 +2318,37 @@
     // 12. Batch: Service AreasページのパネルUI
     // ===========================================================
 
-    function injectPanel() {
-        if (!serviceAreaId()) return;
-        if (document.getElementById('ufraa-ssd-panel')) return;
-        if (!document.body) return;
-
-        // "Assignment Plans" セクション内のtools-filtering_を探す
-        let toolsFiltering = null;
-        document.querySelectorAll('[class*="heading-text_"]').forEach((h) => {
-            if (h.textContent.trim() !== 'Assignment Plans') return;
+    function findSectionToolsFiltering(sectionTitle) {
+        for (const heading of document.querySelectorAll('[class*="heading-text_"]')) {
+            if (heading.textContent.trim() !== sectionTitle) continue;
             const container =
-                h.closest('[class*="variant-container_"]') ||
-                h.closest('[class*="header-controls_"]')?.parentElement;
-            if (container) toolsFiltering = container.querySelector('[class*="tools-filtering_"]');
-        });
-        if (!toolsFiltering) toolsFiltering = document.querySelector('[class*="tools-filtering_"]');
+                heading.closest('[class*="variant-container_"]') ||
+                heading.closest('[class*="header-controls_"]')?.parentElement;
+            const toolsFiltering = container?.querySelector('[class*="tools-filtering_"]');
+            if (toolsFiltering) return toolsFiltering;
+        }
+        return null;
+    }
+
+    function injectPanelForSection(sectionTitle, suffix) {
+        const idSuffix = suffix ? `-${suffix}` : '';
+        const panelId = `ufraa-ssd-panel${idSuffix}`;
+        if (document.getElementById(panelId)) return;
+
+        const toolsFiltering = findSectionToolsFiltering(sectionTitle);
         if (!toolsFiltering) return;
 
         const toolsRow = toolsFiltering.parentElement;
+        if (!toolsRow) return;
 
         const panel = document.createElement('div');
-        panel.id = 'ufraa-ssd-panel';
+        panel.id = panelId;
+        panel.dataset.ufraaBatchPanel = sectionTitle;
         panel.style.cssText = 'display:flex;align-items:center;gap:8px;margin-left:auto;';
 
         // 認証状態
         const authSpan = document.createElement('span');
-        authSpan.id = 'ufraa-ssd-auth';
+        authSpan.id = `ufraa-ssd-auth${idSuffix}`;
         authSpan.style.cssText = 'font-size:10px;margin-right:4px;';
 
         const mkLabel = (text) => {
@@ -2166,7 +2359,7 @@
         };
         const mkDateInput = (id) => {
             const i = document.createElement('input');
-            i.id = id;
+            i.id = `${id}${idSuffix}`;
             i.type = 'date';
             i.value = todayJst();
             i.style.cssText = 'padding:4px 6px;border:1px solid #aaa;border-radius:4px;font-size:13px;height:32px;';
@@ -2178,13 +2371,14 @@
 
         // SSDドロップダウン
         const select = document.createElement('select');
-        select.id = 'ufraa-ssd-select';
+        select.id = `ufraa-ssd-select${idSuffix}`;
+        select.dataset.ufraaBatchCycleSelect = 'true';
         select.style.cssText = 'padding:4px 6px;border:1px solid #aaa;border-radius:4px;font-size:13px;height:32px;';
         fillCycleSelect(select, true);
 
         // 実行ボタン
         const runBtn = document.createElement('button');
-        runBtn.id = 'ufraa-ssd-run';
+        runBtn.id = `ufraa-ssd-run${idSuffix}`;
         runBtn.textContent = 'CSV出力';
         runBtn.style.cssText =
             'padding:0 16px;background:#0073bb;color:#fff;border:none;border-radius:4px;cursor:pointer;' +
@@ -2192,11 +2386,11 @@
         runBtn.addEventListener('mouseover', () => (runBtn.style.background = '#005a8c'));
         runBtn.addEventListener('mouseout', () => (runBtn.style.background = '#0073bb'));
 
-        const cycleSettingsBtn = makeCycleSettingsButton('ufraa-batch-cycle-settings-btn');
+        const cycleSettingsBtn = makeCycleSettingsButton(`ufraa-batch-cycle-settings-btn${idSuffix}`);
 
         // ステータス
         const statusSpan = document.createElement('span');
-        statusSpan.id = 'ufraa-ssd-status';
+        statusSpan.id = `ufraa-ssd-status${idSuffix}`;
         statusSpan.style.cssText = 'font-size:10px;color:#555;';
 
         runBtn.addEventListener('click', async () => {
@@ -2247,11 +2441,19 @@
         toolsRow.appendChild(panel);
 
         // 認証状態を定期更新
-        setInterval(() => {
+        const updateAuth = () => {
             const ok = AUTH.creds && AUTH.midway;
             authSpan.textContent = ok ? '✅' : '⏳';
             authSpan.title = ok ? '認証取得済み' : '認証待ち（リロードで取得）';
-        }, 1500);
+        };
+        updateAuth();
+        setInterval(updateAuth, 1500);
+    }
+
+    function injectPanel() {
+        if (!serviceAreaId() || !document.body) return;
+        injectPanelForSection('Assignment Plans', '');
+        injectPanelForSection('SSD Route Plans', 'route');
     }
 
     // ===========================================================
@@ -2296,6 +2498,7 @@
         }
         if (serviceAreaId()) injectPanel();
         if (artifactIdFromPath()) collectAssignmentPage();
+        if (ssdRoutePlanIdFromPath()) collectSsdRoutePage();
     }
 
     setInterval(tick, TICK_INTERVAL_MS);
