@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ufraa
 // @namespace    https://github.com/yuyna-amazon/Ufraa
-// @version      4.3
+// @version      4.4
 // @description  Ufraa Assignment Plan: Route Duration乖離表示 + SSDラベル + CSV出力 / Service AreasからSSD時間帯を一括巡回してCSV出力
 // @author       yuyna
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=amazon.com
@@ -102,7 +102,8 @@
         'Route Promise Time',
         'Dispatch Window Start',
         'Dispatch Window End',
-        'Matched Block'
+        'Matched Block',
+        'Closure Reason'
     ];
 
     // Live画面のFilter入力欄に自動入力する文字列
@@ -2159,7 +2160,10 @@
             return byDateTime || (a[3] || '').localeCompare(b[3] || '');
         });
 
-        displaySPR(calculateSPR(rows, 7, 15, true), anchorPanel);
+        displaySPR(
+            calculateSPR(rows, headers.indexOf('Packages'), headers.indexOf('Matched Block'), true),
+            anchorPanel
+        );
 
         const sa = serviceAreaId() || 'sa';
         downloadText(arrToCsv(headers, rows), `ssd_route_batch_${sa.slice(0, 8)}_${stampNow()}.csv`);
