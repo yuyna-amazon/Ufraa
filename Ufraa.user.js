@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ufraa
 // @namespace    https://github.com/yuyna-amazon/Ufraa
-// @version      6.2
+// @version      6.3
 // @description  Ufraa Assignment Plan: Route Duration乖離表示 + SSDラベル + CSV出力 / Service AreasからAssignment・SSD Route Planを直接一括取得
 // @author       yuyna
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=amazon.com
@@ -126,7 +126,8 @@
         'Dispatch Window End',
         'Matched Block',
         'Delivery Window End',
-        'Closure Reason'
+        'Closure Reason',
+        'Route Duration %'
     ];
 
     // Live画面のFilter入力欄に自動入力する文字列
@@ -622,6 +623,17 @@
         return candidates;
     }
 
+    function formatRouteDurationPercent(routeDuration, matchedBlockDuration) {
+        const routeSeconds = durationSeconds(routeDuration);
+        let blockSeconds = durationSeconds(matchedBlockDuration);
+        if (blockSeconds === null && typeof matchedBlockDuration === 'string') {
+            const blockMinutes = parseBlockLengthMinutes(matchedBlockDuration);
+            blockSeconds = blockMinutes === null ? null : blockMinutes * 60;
+        }
+        if (routeSeconds === null || blockSeconds === null || blockSeconds <= 0) return '';
+        return `${((routeSeconds / blockSeconds) * 100).toFixed(1)}%`;
+    }
+
     function matchedBlockText(route, flat) {
         const direct = flatValue(flat, ['matchedBlock'], false);
         if (direct !== null && direct !== undefined && typeof direct !== 'object') return String(direct);
@@ -667,6 +679,10 @@
             const packages = flatValue(flat, ['packageCount', 'packagesCount', 'numberOfPackages', 'packages']);
             const packageText = Array.isArray(packages) ? String(packages.length) : formatListValue(packages);
             const routeDuration = flatValue(flat, ['routeDurationWithoutInboundStem']);
+            const matchedBlockDuration = flatValue(flat, [
+                'matchedBlock.usableDuration', 'matchedBlock.blockDuration', 'matchedBlock.duration',
+                'matchedBlock.blockLength', 'blockMatch.blockDuration', 'matchedBlockDuration'
+            ]);
             const dispatchWindowEnd = flatValue(flat, [
                 'dispatchWindowEnd', 'dispatchWindow.endTime', 'dispatchWindow.end', 'dispatchEnd'
             ]);
@@ -688,7 +704,8 @@
                 formatDateTimeValue(dispatchWindowEnd),
                 matchedBlockText(route, flat),
                 deliveryWindowEnd,
-                formatListValue(flatValue(flat, ['closureReason', 'routeClosureReason']))
+                formatListValue(flatValue(flat, ['closureReason', 'routeClosureReason'])),
+                formatRouteDurationPercent(routeDuration, matchedBlockDuration)
             ];
         }).filter((row) => row[1]);
 
@@ -3001,7 +3018,9 @@
         const routeIdColIdx = headers.indexOf('Route ID');
         const routeDurationColIdx = headers.indexOf('Route Duration Without Inbound Stem');
         const dispatchEndColIdx = headers.indexOf('Dispatch Window End');
+        const matchedBlockColIdx = headers.indexOf('Matched Block');
         const deliveryEndColIdx = headers.indexOf('Delivery Window End');
+        const routeDurationPercentColIdx = headers.indexOf('Route Duration %');
 
         // 同じRoute IDは、取得した全時間のうち最も新しい状態だけを採用する。
         const latestByRouteId = new Map();
@@ -3039,6 +3058,14 @@
                         parseTimeOfDayToMinutes(row[deliveryEndColIdx])
                     );
                     if (label) row[0] = label;
+                }
+
+                if (routeDurationPercentColIdx >= 0 && !row[routeDurationPercentColIdx] &&
+                    routeDurationColIdx >= 0 && matchedBlockColIdx >= 0) {
+                    row[routeDurationPercentColIdx] = formatRouteDurationPercent(
+                        row[routeDurationColIdx],
+                        row[matchedBlockColIdx]
+                    );
                 }
 
                 const routeId = routeIdColIdx >= 0 ? (row[routeIdColIdx] || '').trim() : '';
@@ -3311,7 +3338,7 @@
         if (existingPanel) {
             if (!document.getElementById(cycleSettingsButtonId)) {
                 existingPanel.appendChild(makeCycleSettingsButton(cycleSettingsButtonId));
-                console.log(`[Ufraa v6.2] ${sectionTitle}のCycle設定ボタンを補完`);
+                console.log(`[Ufraa v6.3] ${sectionTitle}のCycle設定ボタンを補完`);
             }
             return;
         }
@@ -3465,5 +3492,5 @@
     if (document.readyState !== 'loading') tick();
     document.addEventListener('DOMContentLoaded', tick);
 
-    console.log('[Ufraa v6.2] 起動 (Assignment Plan + SSD Batch CSV)');
+    console.log('[Ufraa v6.3] 起動 (Assignment Plan + SSD Batch CSV)');
 })();
