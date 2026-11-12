@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ufraa
 // @namespace    https://github.com/yuyna-amazon/Ufraa
-// @version      5.9
+// @version      6.0
 // @description  Ufraa Assignment Plan: Route Duration乖離表示 + SSDラベル + CSV出力 / Service AreasからAssignment・SSD Route Planを直接一括取得
 // @author       yuyna
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=amazon.com
@@ -565,6 +565,18 @@
 
         const ms = Date.parse(text);
         return Number.isNaN(ms) ? null : ms;
+    }
+
+    function normalizeYmd(value) {
+        const match = String(value || '').match(/(\d{4})[\/-](\d{1,2})[\/-](\d{1,2})/);
+        return match ? `${match[1]}-${p2(match[2])}-${p2(match[3])}` : '';
+    }
+
+    function jstDateFromDateTime(value) {
+        const ms = parseDateTimeMs(value);
+        if (ms === null) return '';
+        const jst = new Date(ms + 9 * 3600 * 1000);
+        return `${jst.getUTCFullYear()}-${p2(jst.getUTCMonth() + 1)}-${p2(jst.getUTCDate())}`;
     }
 
     /** Dispatch Window Endに未丸めのRoute Durationを加え、JSTのHH:MMを返す */
@@ -3005,6 +3017,12 @@
                     ...indexes.map((index) => (index >= 0 ? sourceRow[index] || '' : ''))
                 ];
 
+                const baseDate = normalizeYmd(row[1]);
+                const dispatchEndDate = dispatchEndColIdx >= 0
+                    ? jstDateFromDateTime(row[dispatchEndColIdx])
+                    : '';
+                if (baseDate && dispatchEndDate && dispatchEndDate > baseDate) continue;
+
                 // Delivery Window End = Dispatch Window End + Route Duration Without Inbound Stem。
                 // 直接取得時は未丸めの生秒数で計算済み。画面巡回時だけ表示値から補完する。
                 if (deliveryEndColIdx >= 0) {
@@ -3339,7 +3357,7 @@
         if (existingPanel) {
             if (!document.getElementById(cycleSettingsButtonId)) {
                 existingPanel.appendChild(makeCycleSettingsButton(cycleSettingsButtonId));
-                console.log(`[Ufraa v5.9] ${sectionTitle}のCycle設定ボタンを補完`);
+                console.log(`[Ufraa v5.10] ${sectionTitle}のCycle設定ボタンを補完`);
             }
             return;
         }
@@ -3503,5 +3521,5 @@
     if (document.readyState !== 'loading') tick();
     document.addEventListener('DOMContentLoaded', tick);
 
-    console.log('[Ufraa v5.9] 起動 (Assignment Plan + SSD Batch CSV)');
+    console.log('[Ufraa v5.10] 起動 (Assignment Plan + SSD Batch CSV)');
 })();
