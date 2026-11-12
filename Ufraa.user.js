@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Ufraa
 // @namespace    https://github.com/yuyna-amazon/Ufraa
-// @version      4.4
-// @description  Ufraa Assignment Plan: Route Duration乖離表示 + SSDラベル + CSV出力 / Service AreasからSSD時間帯を一括巡回してCSV出力
+// @version      5.9
+// @description  Ufraa Assignment Plan: Route Duration乖離表示 + SSDラベル + CSV出力 / Service AreasからAssignment・SSD Route Planを直接一括取得
 // @author       yuyna
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=amazon.com
 // @match        https://viz-fe.ufraa.last-mile.amazon.dev/*
@@ -27,7 +27,7 @@
     const CHECK_INTERVAL_MS = 5000;
     const TICK_INTERVAL_MS = 500;
 
-    const CYCLE_SETTINGS_VERSION = 4;
+    const CYCLE_SETTINGS_VERSION = 8;
     const LEGACY_SIX_CYCLE_DEFAULTS_UNDERSCORED_0600 = Object.freeze([
         Object.freeze({ name: 'SSD_1',   endTime: '06:00' }),
         Object.freeze({ name: 'SSD_1_B', endTime: '09:00' }),
@@ -44,30 +44,52 @@
         Object.freeze({ name: 'SSD3_B', endTime: '19:00' }),
         Object.freeze({ name: 'SSD4',   endTime: '22:00' })
     ]);
+    const LEGACY_SIX_CYCLE_DEFAULTS_V4 = Object.freeze([
+        Object.freeze({ name: 'SSD1',   endTime: '05:55' }),
+        Object.freeze({ name: 'SSD1_B', endTime: '08:55' }),
+        Object.freeze({ name: 'SSD2',   endTime: '11:55' }),
+        Object.freeze({ name: 'SSD3',   endTime: '15:55' }),
+        Object.freeze({ name: 'SSD3_B', endTime: '18:55' }),
+        Object.freeze({ name: 'SSD4',   endTime: '21:55' })
+    ]);
+    const LEGACY_EIGHT_CYCLE_DEFAULTS_V4 = Object.freeze([
+        Object.freeze({ name: 'SSDF_1', endTime: '05:35' }),
+        Object.freeze({ name: 'SSDF_2', endTime: '08:35' }),
+        Object.freeze({ name: 'SSDF_3', endTime: '11:35' }),
+        Object.freeze({ name: 'SSDF_4', endTime: '14:35' }),
+        Object.freeze({ name: 'SSDF_5', endTime: '17:35' }),
+        Object.freeze({ name: 'SSDF_6', endTime: '19:35' }),
+        Object.freeze({ name: 'SSDF_7', endTime: '21:20' }),
+        Object.freeze({ name: 'SSDF_8', endTime: '23:05' })
+    ]);
+    const LEGACY_BLOCK_STARTS_V6 = Object.freeze({
+        '6': Object.freeze(['04:30', '07:00', '10:00', '14:00', '17:00', '21:30']),
+        '8': Object.freeze(['04:00', '07:00', '10:00', '13:00', '16:00', '19:00', '21:00', '22:00'])
+    });
     const DEFAULT_CYCLE_SETTINGS = Object.freeze({
         version: CYCLE_SETTINGS_VERSION,
         selectedCycleCount: 6,
         configs: Object.freeze({
             '6': Object.freeze({
                 cycles: Object.freeze([
-                    Object.freeze({ name: 'SSD1',   endTime: '05:55' }),
-                    Object.freeze({ name: 'SSD1_B', endTime: '08:55' }),
-                    Object.freeze({ name: 'SSD2',   endTime: '11:55' }),
-                    Object.freeze({ name: 'SSD3',   endTime: '15:55' }),
-                    Object.freeze({ name: 'SSD3_B', endTime: '18:55' }),
-                    Object.freeze({ name: 'SSD4',   endTime: '21:55' })
+                    Object.freeze({ name: 'SSD1',   blockStart: '03:00', finalDispatch: '05:45', endTime: '07:59' }),
+                    Object.freeze({ name: 'SSD1_B', blockStart: '06:00', finalDispatch: '08:45', endTime: '10:59' }),
+                    Object.freeze({ name: 'SSD2',   blockStart: '09:00', finalDispatch: '11:45', endTime: '13:59' }),
+                    Object.freeze({ name: 'SSD3',   blockStart: '12:00', finalDispatch: '15:45', endTime: '17:59' }),
+                    Object.freeze({ name: 'SSD3_B', blockStart: '16:00', finalDispatch: '18:45', endTime: '20:59' }),
+                    Object.freeze({ name: 'SSD4',   blockStart: '19:00', finalDispatch: '22:30', endTime: '23:59' })
                 ])
             }),
             '8': Object.freeze({
                 cycles: Object.freeze([
-                    Object.freeze({ name: 'SSDF_1', endTime: '05:35' }),
-                    Object.freeze({ name: 'SSDF_2', endTime: '08:35' }),
-                    Object.freeze({ name: 'SSDF_3', endTime: '11:35' }),
-                    Object.freeze({ name: 'SSDF_4', endTime: '14:35' }),
-                    Object.freeze({ name: 'SSDF_5', endTime: '17:35' }),
-                    Object.freeze({ name: 'SSDF_6', endTime: '19:35' }),
-                    Object.freeze({ name: 'SSDF_7', endTime: '21:20' }),
-                    Object.freeze({ name: 'SSDF_8', endTime: '23:05' })
+                    Object.freeze({ name: 'SSDF_1', blockStart: '03:00', finalDispatch: '05:30', endTime: '07:00' }),
+                    Object.freeze({ name: 'SSDF_2', blockStart: '05:45', finalDispatch: '08:30', endTime: '10:00' }),
+                    Object.freeze({ name: 'SSDF_3', blockStart: '08:45', finalDispatch: '11:30', endTime: '13:00' }),
+                    Object.freeze({ name: 'SSDF_4', blockStart: '11:45', finalDispatch: '14:30', endTime: '16:00' }),
+                    Object.freeze({ name: 'SSDF_5', blockStart: '14:45', finalDispatch: '17:30', endTime: '19:00' }),
+                    Object.freeze({ name: 'SSDF_6', blockStart: '17:45', finalDispatch: '19:30', endTime: '21:00' }),
+                    Object.freeze({ name: 'SSDF_7', blockStart: '19:45', finalDispatch: '21:15', endTime: '23:00' }),
+                    Object.freeze({ name: 'SSDF_8', blockStart: '21:30', finalDispatch: '23:00', endTime: '23:59' })
                 ])
             })
         })
@@ -103,6 +125,7 @@
         'Dispatch Window Start',
         'Dispatch Window End',
         'Matched Block',
+        'Delivery Window End',
         'Closure Reason'
     ];
 
@@ -122,6 +145,7 @@
     const SERVICE = 'execute-api';
     const EMPTY_SHA256 = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
     const INPUT_TYPE = 'FLEX_ROUTE_ASSIGNMENT_PLANNER_INPUT';
+    const PLAN_TYPE = 'FLEX_ROUTE_ASSIGNMENT_PLAN';
     const SSD_ROUTE_PLAN_TYPES = [
         'FLEX_SSD_ROUTE_PLAN',
         'SSD_ROUTE_PLAN',
@@ -293,6 +317,42 @@
         return origFetch(url, { method: 'GET', mode: 'cors', credentials: 'omit', headers });
     }
 
+    async function signedPost(pathOnly, value) {
+        if (!AUTH.creds || !AUTH.midway) throw new Error('認証情報が未取得です。ページを一度リロードしてください。');
+        const { AccessKeyId, SecretKey, SessionToken } = AUTH.creds;
+        const amzDate = new Date().toISOString().replace(/[:-]|\.\d{3}/g, '');
+        const dateStamp = amzDate.slice(0, 8);
+        const body = JSON.stringify(value);
+        const payloadHash = await sha256Hex(body);
+        const canonicalHeaders =
+            `host:${HOST}\nx-amz-date:${amzDate}\nx-amz-security-token:${SessionToken}\nx-midway-token:${AUTH.midway}\n`;
+        const signedHeaders = 'host;x-amz-date;x-amz-security-token;x-midway-token';
+        const canonicalRequest = `POST\n${pathOnly}\n\n${canonicalHeaders}\n${signedHeaders}\n${payloadHash}`;
+        const scope = `${dateStamp}/${REGION}/${SERVICE}/aws4_request`;
+        const stringToSign = `AWS4-HMAC-SHA256\n${amzDate}\n${scope}\n${await sha256Hex(canonicalRequest)}`;
+        const kDate = await hmac(enc.encode('AWS4' + SecretKey), dateStamp);
+        const kRegion = await hmac(kDate, REGION);
+        const kService = await hmac(kRegion, SERVICE);
+        const kSigning = await hmac(kService, 'aws4_request');
+        const signature = toHex(await hmac(kSigning, stringToSign));
+        const authorization =
+            `AWS4-HMAC-SHA256 Credential=${AccessKeyId}/${scope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
+        const headers = {
+            Authorization: authorization,
+            'Content-Type': 'application/json',
+            'X-Amz-Date': amzDate,
+            'X-Amz-Security-Token': SessionToken,
+            'x-midway-token': AUTH.midway
+        };
+        return origFetch(`https://${HOST}${pathOnly}`, {
+            method: 'POST',
+            mode: 'cors',
+            credentials: 'omit',
+            headers,
+            body
+        });
+    }
+
     async function gunzipText(res) {
         const buf = new Uint8Array(await res.arrayBuffer());
         if (buf.length > 2 && buf[0] === 0x1f && buf[1] === 0x8b) {
@@ -316,11 +376,26 @@
         return null;
     }
 
-    /** 1時間刻みでartifact-metadataを取得して重複排除 */
+    async function apiPostJson(pathOnly, value, tries = 3) {
+        for (let i = 0; i < tries; i++) {
+            const res = await signedPost(pathOnly, value);
+            if (res.ok) {
+                try { return JSON.parse(await gunzipText(res)); } catch (e) { return null; }
+            }
+            if ([401, 403, 429, 500, 502, 503].includes(res.status) && i < tries - 1) {
+                await sleep(2000);
+                continue;
+            }
+            return null;
+        }
+        return null;
+    }
+
+    /** 2時間刻みでartifact-metadataを取得して重複排除 */
     async function fetchArtifactMeta(sa, startSec, endSec, artifactType) {
         let all = [];
-        for (let t = startSec; t < endSec; t += 3600) {
-            const to = Math.min(t + 3600, endSec);
+        for (let t = startSec; t < endSec; t += 7200) {
+            const to = Math.min(t + 7200, endSec);
             const j = await apiGetJson('/prod/artifact-metadata', {
                 scope: sa,
                 artifactType,
@@ -346,9 +421,699 @@
     async function fetchSsdRoutePlanMeta(sa, startSec, endSec) {
         for (const artifactType of SSD_ROUTE_PLAN_TYPES) {
             const list = await fetchArtifactMeta(sa, startSec, endSec, artifactType);
-            if (list.length) return list;
+            if (list.length) return list.map((artifact) => ({ ...artifact, artifactType }));
         }
         return [];
+    }
+
+    /** オブジェクト内から最初のHTTP URLを探す */
+    function findHttpUrl(value, seen = new Set()) {
+        if (typeof value === 'string') return /^https?:\/\//i.test(value) ? value : null;
+        if (!value || typeof value !== 'object' || seen.has(value)) return null;
+        seen.add(value);
+        for (const child of Object.values(value)) {
+            const found = findHttpUrl(child, seen);
+            if (found) return found;
+        }
+        return null;
+    }
+
+    /** DRAS参照APIを50件単位で呼び、Artifact参照情報を取得する */
+    async function fetchArtifactReferencesDirect(items) {
+        const references = [];
+        for (let offset = 0; offset < items.length; offset += 50) {
+            const artifactIdentifiers = items.slice(offset, offset + 50).map((item) => ({
+                artifactId: item.id,
+                artifactType: item.artifactType
+            }));
+            const response = await apiPostJson('/prod/artifact-reference', { artifactIdentifiers });
+            if (!response || !Array.isArray(response.artifactReferences)) {
+                throw new Error('Artifact参照情報を取得できませんでした。');
+            }
+            references.push(...response.artifactReferences);
+        }
+        return references;
+    }
+
+    /** 事前取得したDRAS参照情報からArtifact本体を直接取得する */
+    async function fetchArtifactJsonDirect(reference) {
+        const artifactUrl = reference && (reference.reference || findHttpUrl(reference));
+        if (!artifactUrl) throw new Error('Artifact参照URLを取得できませんでした。');
+
+        const response = await origFetch(artifactUrl, {
+            method: 'GET',
+            mode: 'cors',
+            credentials: 'omit'
+        });
+        if (!response.ok) throw new Error(`Artifact取得失敗 (${response.status})`);
+        const text = await gunzipText(response);
+        try {
+            return JSON.parse(text);
+        } catch (e) {
+            throw new Error('ArtifactのJSON解析に失敗しました。');
+        }
+    }
+
+    function normalizeFieldName(value) {
+        return String(value || '').replace(/[^a-z0-9]/gi, '').toLowerCase();
+    }
+
+    function flattenObject(value, prefix = '', output = {}, depth = 0) {
+        if (depth > 8 || value === null || value === undefined) return output;
+        if (Array.isArray(value) || typeof value !== 'object') {
+            if (prefix) output[prefix] = value;
+            return output;
+        }
+        for (const [key, child] of Object.entries(value)) {
+            const path = prefix ? `${prefix}.${key}` : key;
+            if (child && typeof child === 'object' && !Array.isArray(child)) {
+                flattenObject(child, path, output, depth + 1);
+            } else {
+                output[path] = child;
+            }
+        }
+        return output;
+    }
+
+    function flatValue(flat, aliases, allowSuffix = true) {
+        const entries = Object.entries(flat);
+        for (const alias of aliases) {
+            const wanted = normalizeFieldName(alias);
+            const exact = entries.find(([path]) => normalizeFieldName(path.split('.').pop()) === wanted);
+            if (exact) return exact[1];
+            if (allowSuffix) {
+                const suffix = entries.find(([path]) => normalizeFieldName(path).endsWith(wanted));
+                if (suffix) return suffix[1];
+            }
+        }
+        return null;
+    }
+
+    function durationSeconds(value) {
+        if (value === null || value === undefined || value === '') return null;
+        if (typeof value === 'number') {
+            if (!Number.isFinite(value)) return null;
+            return value > 43200 ? value / 1000 : value;
+        }
+        if (typeof value === 'object') {
+            if (Number.isFinite(value.seconds)) return Number(value.seconds) + (Number(value.nanos) || 0) / 1e9;
+            if (Number.isFinite(value.milliseconds)) return Number(value.milliseconds) / 1000;
+            return null;
+        }
+        const text = String(value).trim();
+        const iso = /^P(?:([\d.]+)D)?(?:T(?:([\d.]+)H)?(?:([\d.]+)M)?(?:([\d.]+)S)?)?$/i.exec(text);
+        if (iso) {
+            return (Number(iso[1]) || 0) * 86400 + (Number(iso[2]) || 0) * 3600 +
+                (Number(iso[3]) || 0) * 60 + (Number(iso[4]) || 0);
+        }
+        const displayMinutes = parseDurationToMinutes(text);
+        return displayMinutes === null ? null : displayMinutes * 60;
+    }
+
+    function formatDurationValue(value) {
+        const seconds = durationSeconds(value);
+        if (seconds === null) return value === null || value === undefined ? '' : String(value);
+        const totalMinutes = Math.round(seconds / 60);
+        const hours = Math.floor(totalMinutes / 60);
+        const minutes = totalMinutes % 60;
+        if (hours && minutes) return `${hours}h ${minutes}m`;
+        if (hours) return `${hours}h`;
+        return `${minutes}m`;
+    }
+
+    function formatDateTimeValue(value) {
+        if (value === null || value === undefined) return '';
+        const text = String(value);
+        if (!/[TZ]|[+-]\d\d:?\d\d$/i.test(text)) return text;
+        const ms = Date.parse(text);
+        if (Number.isNaN(ms)) return text;
+        const date = new Date(ms + 9 * 3600 * 1000);
+        return `${date.getUTCFullYear()}-${p2(date.getUTCMonth() + 1)}-${p2(date.getUTCDate())} ` +
+            `${p2(date.getUTCHours())}:${p2(date.getUTCMinutes())}:${p2(date.getUTCSeconds())} JST`;
+    }
+
+    function parseDateTimeMs(value) {
+        if (value === null || value === undefined || value === '') return null;
+        const text = String(value).trim();
+        const jst = /^(\d{4})[\/-](\d{1,2})[\/-](\d{1,2})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*JST$/i.exec(text);
+        if (jst) {
+            const jstMs = Date.parse(
+                `${jst[1]}-${p2(jst[2])}-${p2(jst[3])}T${p2(jst[4])}:${jst[5]}:${jst[6] || '00'}+09:00`
+            );
+            return Number.isNaN(jstMs) ? null : jstMs;
+        }
+
+        const ms = Date.parse(text);
+        return Number.isNaN(ms) ? null : ms;
+    }
+
+    /** Dispatch Window Endに未丸めのRoute Durationを加え、JSTのHH:MMを返す */
+    function calculateDeliveryWindowEnd(dispatchWindowEnd, routeDuration) {
+        const dispatchEndMs = parseDateTimeMs(dispatchWindowEnd);
+        const seconds = durationSeconds(routeDuration);
+        if (dispatchEndMs === null || seconds === null) return '';
+
+        const roundedMs = Math.round((dispatchEndMs + seconds * 1000) / 60000) * 60000;
+        const jst = new Date(roundedMs + 9 * 3600 * 1000);
+        return `${p2(jst.getUTCHours())}:${p2(jst.getUTCMinutes())}`;
+    }
+
+    function formatListValue(value) {
+        if (value === null || value === undefined) return '';
+        if (Array.isArray(value)) return value.map((item) =>
+            item && typeof item === 'object' ? JSON.stringify(item) : String(item)
+        ).join(', ');
+        if (typeof value === 'object') return JSON.stringify(value);
+        return String(value);
+    }
+
+    function findRouteArray(value, candidates = [], depth = 0) {
+        if (!value || depth > 8) return candidates;
+        if (Array.isArray(value)) {
+            const objects = value.filter((item) => item && typeof item === 'object' && !Array.isArray(item));
+            if (objects.length) {
+                const sample = flattenObject(objects[0]);
+                const names = Object.keys(sample).map(normalizeFieldName);
+                let score = 0;
+                if (names.some((name) => name.endsWith('routeid') || name.endsWith('sortgroupid'))) score += 5;
+                if (names.some((name) => name.endsWith('routecode'))) score += 3;
+                if (names.some((name) => name.endsWith('status') || name.endsWith('sortgroupstatus'))) score += 2;
+                if (names.some((name) => name.includes('dispatchwindow'))) score += 1;
+                candidates.push({ value: objects, score, length: objects.length });
+            }
+            for (const child of value.slice(0, 10)) findRouteArray(child, candidates, depth + 1);
+            return candidates;
+        }
+        if (typeof value === 'object') {
+            for (const child of Object.values(value)) findRouteArray(child, candidates, depth + 1);
+        }
+        return candidates;
+    }
+
+    function matchedBlockText(route, flat) {
+        const direct = flatValue(flat, ['matchedBlock'], false);
+        if (direct !== null && direct !== undefined && typeof direct !== 'object') return String(direct);
+
+        const flatType = flatValue(flat, [
+            'matchedBlock.blockGroup.transporterType', 'matchedBlock.blockType',
+            'matchedBlock.type', 'blockMatch.blockType', 'matchedBlockType'
+        ]);
+        const flatDuration = flatValue(flat, [
+            'matchedBlock.usableDuration', 'matchedBlock.blockDuration', 'matchedBlock.duration',
+            'matchedBlock.blockLength', 'blockMatch.blockDuration', 'matchedBlockDuration'
+        ]);
+        if (flatType !== null || flatDuration !== null) {
+            return [
+                flatType !== null ? String(flatType) : '',
+                flatDuration !== null ? formatDurationValue(flatDuration) : ''
+            ].filter(Boolean).join(', ');
+        }
+
+        const block = route.matchedBlock || route.blockMatch || route.block;
+        if (!block || typeof block !== 'object') return direct ? formatListValue(direct) : '';
+        const blockFlat = flattenObject(block);
+        const type = flatValue(blockFlat, ['type', 'blockType', 'serviceType']);
+        const duration = flatValue(blockFlat, ['duration', 'blockDuration', 'length', 'blockLength']);
+        return [type ? String(type) : '', duration !== null ? formatDurationValue(duration) : '']
+            .filter(Boolean)
+            .join(', ');
+    }
+
+    /** SSD Route Plan Artifactを既存CSV用のテーブル形式へ変換 */
+    function parseSsdRouteArtifact(artifact) {
+        let routeList = Array.isArray(artifact?.matchEligibleRoutes) ? artifact.matchEligibleRoutes : null;
+        if (!routeList) {
+            const candidates = findRouteArray(artifact)
+                .filter((candidate) => candidate.score >= 5)
+                .sort((a, b) => b.score - a.score || b.length - a.length);
+            if (!candidates.length) throw new Error('Route一覧を認識できませんでした。');
+            routeList = candidates[0].value;
+        }
+
+        const rows = routeList.map((route) => {
+            const flat = flattenObject(route);
+            const packages = flatValue(flat, ['packageCount', 'packagesCount', 'numberOfPackages', 'packages']);
+            const packageText = Array.isArray(packages) ? String(packages.length) : formatListValue(packages);
+            const routeDuration = flatValue(flat, ['routeDurationWithoutInboundStem']);
+            const dispatchWindowEnd = flatValue(flat, [
+                'dispatchWindowEnd', 'dispatchWindow.endTime', 'dispatchWindow.end', 'dispatchEnd'
+            ]);
+            const deliveryWindowEnd = calculateDeliveryWindowEnd(dispatchWindowEnd, routeDuration);
+            return [
+                formatListValue(flatValue(flat, ['routeCode', 'routeName'])),
+                formatListValue(flatValue(flat, ['sortGroupId', 'routeId', 'correlationId'])),
+                formatListValue(flatValue(flat, ['sortGroupStatus', 'status', 'routeStatus'])),
+                formatListValue(flatValue(flat, ['routeTags', 'tags'])),
+                packageText,
+                formatDurationValue(routeDuration),
+                formatDurationValue(flatValue(flat, ['inboundStemDuration', 'inboundStem'])),
+                formatDurationValue(flatValue(flat, ['outboundStemDuration', 'outboundStem'])),
+                formatDurationValue(flatValue(flat, ['underTheRoofDuration', 'underTheRoofTime', 'driverUnderTheRoofTimeAtRouteFinish'])),
+                formatDateTimeValue(flatValue(flat, ['routePromiseTime', 'promiseTime'])),
+                formatDateTimeValue(flatValue(flat, [
+                    'dispatchWindowStart', 'dispatchWindow.startTime', 'dispatchWindow.start', 'dispatchStart'
+                ])),
+                formatDateTimeValue(dispatchWindowEnd),
+                matchedBlockText(route, flat),
+                deliveryWindowEnd,
+                formatListValue(flatValue(flat, ['closureReason', 'routeClosureReason']))
+            ];
+        }).filter((row) => row[1]);
+
+        if (!rows.length) throw new Error('Route IDを取得できませんでした。');
+        if (!rows.some((row) => row[2])) throw new Error('Route Statusを取得できませんでした。');
+        return { headers: SSD_ROUTE_CSV_COLUMNS.slice(), rows, count: rows.length };
+    }
+
+    async function mapWithConcurrency(items, concurrency, worker) {
+        const results = new Array(items.length);
+        let next = 0;
+        const runners = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+            while (next < items.length) {
+                const index = next++;
+                try {
+                    results[index] = { ok: true, value: await worker(items[index], index) };
+                } catch (error) {
+                    results[index] = { ok: false, error };
+                }
+            }
+        });
+        await Promise.all(runners);
+        return results;
+    }
+
+    /** 画面遷移なしでSSD Route Plan Artifactを並列取得する */
+    async function collectSsdRoutePlansDirect(items, statusEl) {
+        let references;
+        try {
+            statusEl.textContent = `Artifact参照情報を取得中... (0 / ${items.length})`;
+            references = await fetchArtifactReferencesDirect(items);
+        } catch (error) {
+            return items.map(() => ({ ok: false, error }));
+        }
+
+        const referenceByKey = new Map(references.map((reference) => [
+            `${reference.artifactType}\n${reference.artifactId}`,
+            reference
+        ]));
+        let completed = 0;
+        return mapWithConcurrency(items, 5, async (item) => {
+            const reference = referenceByKey.get(`${item.artifactType}\n${item.id}`) ||
+                references.find((candidate) => candidate.artifactId === item.id);
+            if (!reference) throw new Error('Artifact参照情報が見つかりませんでした。');
+
+            const artifact = await fetchArtifactJsonDirect(reference);
+            const table = parseSsdRouteArtifact(artifact);
+            const store = readSsdRouteCollect();
+            store[item.id] = {
+                date: item.date,
+                time: item.time,
+                ssd: item.ssd,
+                createdAt: item.createdAt,
+                headers: table.headers,
+                rows: table.rows,
+                count: table.count,
+                ts: Date.now()
+            };
+            writeSsdRouteCollect(store);
+            completed += 1;
+            statusEl.textContent = `${completed} / ${items.length} 直接取得中...`;
+            return item;
+        });
+    }
+
+    /** 指定Artifact群の参照取得と本体取得を共通化 */
+    async function fetchJsonArtifactsDirect(items, onProgress) {
+        let references;
+        try {
+            references = await fetchArtifactReferencesDirect(items);
+        } catch (error) {
+            return items.map(() => ({ ok: false, error }));
+        }
+
+        const referenceByKey = new Map(references.map((reference) => [
+            `${reference.artifactType}\n${reference.artifactId}`,
+            reference
+        ]));
+        let completed = 0;
+        return mapWithConcurrency(items, 5, async (item) => {
+            const reference = referenceByKey.get(`${item.artifactType}\n${item.id}`) ||
+                references.find((candidate) => candidate.artifactId === item.id);
+            if (!reference) throw new Error('Artifact参照情報が見つかりませんでした。');
+            const artifact = await fetchArtifactJsonDirect(reference);
+            completed += 1;
+            if (onProgress) onProgress(completed, items.length);
+            return artifact;
+        });
+    }
+
+    function assignmentStatusForRoute(route, plannerInput) {
+        const statuses = Array.isArray(route?.statuses) ? route.statuses : [];
+        if (statuses.some((status) => ['TRANSPORTER_WORK_ASSIGNED', 'ITINERARY_ASSIGNED'].includes(status))) {
+            return 'Assigned';
+        }
+        if (statuses.some((status) => [
+            'TRANSPORTER_ACCEPTED', 'TRANSPORTER_OFFER_ACCEPTED', 'READY_TO_DISPATCH'
+        ].includes(status))) {
+            return 'Accepted';
+        }
+        if (statuses.some((status) => [
+            'TRANSPORTER_ACCEPT_PENDING', 'TRANSPORTER_OFFER_PENDING'
+        ].includes(status))) {
+            return 'Offered';
+        }
+        return plannerInput?.assignmentConfig?.dispatchPlannerType === 'FLEX_DISPATCH_PLANNER' ? 'Open' : 'Planned';
+    }
+
+    function assignmentPackageCount(route) {
+        if (!Array.isArray(route?.actions)) return 0;
+        return route.actions.filter((action) => action?.type === 'ADD' && action.transportRequestDetails).length;
+    }
+
+    function assignmentTransporterIds(plan, assignmentKey) {
+        const ids = new Set();
+        if (assignmentKey) ids.add(assignmentKey);
+        const fromGroup = plan?.transporterGroupToTransportersMap?.[assignmentKey];
+        if (Array.isArray(fromGroup)) fromGroup.forEach((id) => ids.add(id));
+        for (const [transporterId, groupId] of Object.entries(plan?.transporterToTransporterGroupMap || {})) {
+            if (groupId === assignmentKey) ids.add(transporterId);
+        }
+        return ids;
+    }
+
+    function findAssignmentTransporter(plannerInput, plan, assignmentKey, route) {
+        const filteredTransporters = plannerInput?.preProcessingFilteredOutTransporters || {};
+        const transporters = [
+            ...(Array.isArray(plannerInput?.transporters) ? plannerInput.transporters : []),
+            ...(Array.isArray(filteredTransporters.ASSIGNED) ? filteredTransporters.ASSIGNED : []),
+            ...(Array.isArray(filteredTransporters.INFLIGHT_EIO_FOR_TRANSPORTER)
+                ? filteredTransporters.INFLIGHT_EIO_FOR_TRANSPORTER
+                : [])
+        ];
+        const ids = assignmentTransporterIds(plan, assignmentKey);
+        const candidates = transporters.filter((transporter) => ids.has(transporter.transporterId));
+        const reservationId = plan?.routeIdToProviderReservationIdMap?.[route?.routeId] ||
+            route?.assignedReservationId;
+        return candidates.find((transporter) =>
+            reservationId && transporter.providerReservationId === reservationId
+        ) || candidates[0] || transporters.find((transporter) =>
+            transporter.transporterId === route?.assignedTransporter &&
+            (!reservationId || transporter.providerReservationId === reservationId)
+        ) || null;
+    }
+
+    function makeGroupedAssignmentRow(group, plannerInput) {
+        const routes = group.routes || [];
+        const transporters = group.transporters || [];
+        const firstTransporter = transporters[0] || null;
+        const lastTransporter = transporters[transporters.length - 1] || firstTransporter;
+        const shiftStart = firstTransporter?.shiftStartTime || '';
+        const shiftEnd = lastTransporter?.shiftEndTime || '';
+        const shiftStartMs = parseDateTimeMs(shiftStart);
+        const shiftEndMs = parseDateTimeMs(shiftEnd);
+        const blockLength = shiftStartMs !== null && shiftEndMs !== null
+            ? formatDurationValue((shiftEndMs - shiftStartMs) / 1000)
+            : '';
+        const readyToWork = firstTransporter?.readyToWork ?? firstTransporter?.isReadyToWork;
+        const joinRouteValues = (getValue) => routes.map(getValue).filter((value) => value !== '').join(' ');
+        const statuses = group.assignmentStatuses?.length
+            ? group.assignmentStatuses
+            : [group.transporterUnAssignedReason || 'Waiting'];
+
+        return [
+            joinRouteValues((route) => String(route.routeName || '').substring(0, 13)),
+            joinRouteValues((route) => String(route.routeId || '').substring(0, 13)),
+            joinRouteValues((route) => formatDurationValue(route.routeDuration)),
+            joinRouteValues((route) => String(assignmentPackageCount(route))),
+            joinRouteValues((route) => formatDateTimeValue(route.dispatchWindow?.start || '')),
+            joinRouteValues((route) => formatDateTimeValue(route.dispatchWindow?.end || '')),
+            statuses.join(' '),
+            firstTransporter?.transporterId || '',
+            typeof readyToWork === 'boolean' ? (readyToWork ? '👍' : '❌') : '',
+            formatDateTimeValue(shiftStart),
+            formatDateTimeValue(shiftEnd),
+            blockLength
+        ];
+    }
+
+    /** UFRAA本体のFLEX_DISPATCH_PLANNER変換と同じTransporterグループ単位で行を作る */
+    function flexDispatchAssignmentRows(plannerInput, plan) {
+        const filtered = plannerInput?.preProcessingFilteredOutTransporters || {};
+        let transporters = [
+            ...(plannerInput?.transporters || []),
+            ...(filtered.ASSIGNED || []),
+            ...(filtered.INFLIGHT_EIO_FOR_TRANSPORTER || [])
+        ];
+
+        const searchRadiusMinutes = Number(
+            plannerInput?.assignmentConfig?.algorithmParametersMap?.FLEX_DISPATCH_PLANNER?.io_search_radius_minutes
+        );
+        if (Number.isFinite(searchRadiusMinutes) && searchRadiusMinutes > 0) {
+            const searchRadiusSeconds = searchRadiusMinutes * 60;
+            transporters = transporters.filter((transporter) => {
+                if (transporter.type !== 'IO') return true;
+                const durations = Object.values(transporter.addressIdToStemInDuration || {});
+                return !durations.length || Math.min(...durations) < searchRadiusSeconds;
+            });
+        }
+
+        const blocksByTransporter = new Map();
+        for (const transporter of transporters) {
+            const key = `${transporter.transporterId || ''}\n${transporter.type || ''}`;
+            if (!blocksByTransporter.has(key)) blocksByTransporter.set(key, []);
+            blocksByTransporter.get(key).push(transporter);
+        }
+
+        const groups = [];
+        const groupByTransporterAndReservation = new Map();
+        for (const blocks of blocksByTransporter.values()) {
+            blocks.sort((a, b) => {
+                if (!a.shiftStartTime && !b.shiftStartTime) return 0;
+                if (!a.shiftStartTime) return 1;
+                if (!b.shiftStartTime) return -1;
+                return a.shiftStartTime.localeCompare(b.shiftStartTime);
+            });
+            let group = { transporters: [], routes: [], assignmentStatuses: [] };
+            for (let index = 0; index < blocks.length; index += 1) {
+                const transporter = blocks[index];
+                group.transporters.push(transporter);
+                groupByTransporterAndReservation.set(
+                    `${transporter.transporterId || ''}\n${transporter.providerReservationId || ''}`,
+                    group
+                );
+                const next = blocks[index + 1];
+                if (!next || transporter.shiftEndTime !== next.shiftStartTime) {
+                    groups.push(group);
+                    group = { transporters: [], routes: [], assignmentStatuses: [] };
+                }
+            }
+        }
+
+        const reservationByRoute = plan?.routeIdToProviderReservationIdMap || {};
+        const attachRoute = (route, transporterId, statusOverride = null) => {
+            if (!route || !transporterId) return false;
+            const reservationId = reservationByRoute[route.routeId] || route.assignedReservationId || '';
+            const group = groupByTransporterAndReservation.get(`${transporterId}\n${reservationId}`);
+            if (!group) return false;
+            group.routes.push(route);
+            group.assignmentStatuses.push(statusOverride || assignmentStatusForRoute(route, plannerInput));
+            return true;
+        };
+
+        const assignedByTransporter = Object.create(null);
+        for (const route of plannerInput?.preProcessingFilteredOutRoutes?.ASSIGNED || []) {
+            if (route.assignedTransporter && route.assignedReservationId) {
+                assignedByTransporter[route.assignedTransporter] = route;
+            }
+        }
+        for (const [transporterId, route] of Object.entries(assignedByTransporter)) {
+            attachRoute(route, transporterId);
+        }
+
+        const inflightByTransporter = Object.create(null);
+        for (const route of plannerInput?.preProcessingFilteredOutRoutes?.INFLIGHT_EIO_FOR_ROUTE || []) {
+            const reservationId = reservationByRoute[route.routeId] || route.assignedReservationId || '';
+            if (route.assignedTransporter &&
+                groupByTransporterAndReservation.has(`${route.assignedTransporter}\n${reservationId}`)) {
+                inflightByTransporter[route.assignedTransporter] = route;
+            }
+        }
+        for (const [transporterId, route] of Object.entries(inflightByTransporter)) {
+            attachRoute(route, transporterId, 'Inflight Eio');
+        }
+
+        for (const [transporterId, routes] of Object.entries(plan?.fungibleBlockAssignments || {})) {
+            const route = Array.isArray(routes) ? routes[0] : routes;
+            attachRoute(route, transporterId);
+        }
+        for (const mapName of ['rosteredDaAssignments', 'notRosteredDaAssignments', 'instantOfferAssignments']) {
+            for (const [transporterId, route] of Object.entries(plan?.[mapName] || {})) {
+                attachRoute(route, transporterId);
+            }
+        }
+
+        return groups
+            .filter((group) => !(
+                group.transporters[0]?.type === 'NOT_ROSTERED_DA' && !group.assignmentStatuses.length
+            ))
+            .map((group) => makeGroupedAssignmentRow(group, plannerInput));
+    }
+
+    function assignmentRows(plannerInput, plan) {
+        if (plannerInput?.assignmentConfig?.dispatchPlannerType === 'FLEX_DISPATCH_PLANNER') {
+            return flexDispatchAssignmentRows(plannerInput, plan);
+        }
+        const assignments = [];
+        const seenRouteIds = new Set();
+        const usedTransporters = new Set();
+        const transporterKey = (transporter) =>
+            `${transporter?.transporterId || ''}\n${transporter?.providerReservationId || ''}`;
+        const makeTransporterColumns = (transporter) => {
+            const shiftStart = transporter?.shiftStartTime || '';
+            const shiftEnd = transporter?.shiftEndTime || '';
+            const shiftStartMs = parseDateTimeMs(shiftStart);
+            const shiftEndMs = parseDateTimeMs(shiftEnd);
+            const blockLength = shiftStartMs !== null && shiftEndMs !== null
+                ? formatDurationValue((shiftEndMs - shiftStartMs) / 1000)
+                : '';
+            const readyToWork = transporter?.readyToWork ?? transporter?.isReadyToWork;
+            return [
+                transporter?.transporterId || '',
+                typeof readyToWork === 'boolean' ? (readyToWork ? '👍' : '❌') : '',
+                formatDateTimeValue(shiftStart),
+                formatDateTimeValue(shiftEnd),
+                blockLength
+            ];
+        };
+        const addRoute = (route, assignmentKey) => {
+            if (!route || !route.routeId || seenRouteIds.has(route.routeId)) return;
+            const transporter = findAssignmentTransporter(plannerInput, plan, assignmentKey, route);
+            if (!transporter) return;
+            seenRouteIds.add(route.routeId);
+            usedTransporters.add(transporterKey(transporter));
+
+            const dispatchStart = route.dispatchWindow?.start || '';
+            const dispatchEnd = route.dispatchWindow?.end || '';
+            assignments.push([
+                String(route.routeName || '').substring(0, 13),
+                String(route.routeId).substring(0, 13),
+                formatDurationValue(route.routeDuration),
+                String(assignmentPackageCount(route)),
+                formatDateTimeValue(dispatchStart),
+                formatDateTimeValue(dispatchEnd),
+                assignmentStatusForRoute(route, plannerInput),
+                ...makeTransporterColumns(transporter)
+            ]);
+        };
+        const addTransporterOnly = (transporter, status) => {
+            if (!transporter || usedTransporters.has(transporterKey(transporter))) return;
+            usedTransporters.add(transporterKey(transporter));
+            assignments.push([
+                '', '', '', '', '', '', status,
+                ...makeTransporterColumns(transporter)
+            ]);
+        };
+
+        for (const mapName of [
+            'fungibleBlockAssignments', 'instantOfferAssignments',
+            'rosteredDaAssignments', 'notRosteredDaAssignments'
+        ]) {
+            for (const [assignmentKey, value] of Object.entries(plan?.[mapName] || {})) {
+                const routes = Array.isArray(value) ? value : [value];
+                routes.forEach((route) => addRoute(route, assignmentKey));
+            }
+        }
+
+        const inputRoutes = new Map(
+            (plannerInput?.routes || []).map((route) => [route.routeId, route])
+        );
+        for (const [assignmentKey, value] of Object.entries(plan?.overflowAssignments || {})) {
+            const route = value?.route || inputRoutes.get(value?.routeId);
+            addRoute(route, assignmentKey);
+        }
+        for (const route of plannerInput?.preProcessingFilteredOutRoutes?.ASSIGNED || []) {
+            addRoute(route, route.assignedTransporter);
+        }
+        for (const transporter of plan?.transportersWithoutAssignment || []) {
+            addTransporterOnly(transporter, 'Waiting');
+        }
+        for (const transporter of plan?.transportersToBeReleased || []) {
+            addTransporterOnly(transporter, 'Discharged');
+        }
+        for (const transporter of plan?.transportersWithAutoAssignmentNotEnabled || []) {
+            addTransporterOnly(transporter, 'AutoAssignDisabled');
+        }
+
+        return assignments;
+    }
+
+    /** Assignment Planを2段階（planner-input → plan）で直接取得する */
+    async function collectAssignmentPlansDirect(items, statusEl) {
+        statusEl.textContent = `planner-input本体を取得中... (0 / ${items.length})`;
+        const inputItems = items.map((item) => ({
+            ...item,
+            artifactType: INPUT_TYPE
+        }));
+        const inputResults = await fetchJsonArtifactsDirect(inputItems, (done, total) => {
+            statusEl.textContent = `planner-input本体を取得中... (${done} / ${total})`;
+        });
+
+        const planItems = [];
+        const planSourceIndexes = [];
+        const finalResults = items.map(() => null);
+        inputResults.forEach((result, index) => {
+            if (!result?.ok) {
+                finalResults[index] = result;
+                return;
+            }
+            const planId = result.value?.planId;
+            if (!planId) {
+                finalResults[index] = { ok: false, error: new Error('planner-inputにplanIdがありません。') };
+                return;
+            }
+            planItems.push({ id: planId, artifactType: PLAN_TYPE });
+            planSourceIndexes.push(index);
+        });
+
+        if (planItems.length) {
+            statusEl.textContent = `Assignment Plan本体を取得中... (0 / ${planItems.length})`;
+            const planResults = await fetchJsonArtifactsDirect(planItems, (done, total) => {
+                statusEl.textContent = `Assignment Plan本体を取得中... (${done} / ${total})`;
+            });
+            planResults.forEach((planResult, resultIndex) => {
+                const sourceIndex = planSourceIndexes[resultIndex];
+                if (!planResult?.ok) {
+                    finalResults[sourceIndex] = planResult;
+                    return;
+                }
+
+                try {
+                    const plannerInput = inputResults[sourceIndex].value;
+                    const rows = assignmentRows(plannerInput, planResult.value);
+                    if (!rows.length) throw new Error('Ready To Work判定対象のAssignment行を取得できませんでした。');
+                    const item = items[sourceIndex];
+                    const store = readCollect();
+                    store[item.id] = {
+                        date: item.date,
+                        time: item.time,
+                        ssd: item.ssd,
+                        headers: DESIRED_COLUMNS.slice(),
+                        rows,
+                        count: rows.length,
+                        ts: Date.now()
+                    };
+                    writeCollect(store);
+                    finalResults[sourceIndex] = { ok: true, value: item };
+                } catch (error) {
+                    finalResults[sourceIndex] = { ok: false, error };
+                }
+            });
+        }
+
+        return finalResults.map((result) => result || {
+            ok: false,
+            error: new Error('Assignment Planを取得できませんでした。')
+        });
     }
 
     // ===========================================================
@@ -375,7 +1140,7 @@
     }
 
     function migrateCycleSettings(candidate) {
-        if (!candidate || ![1, 2, 3].includes(candidate.version)) return candidate;
+        if (!candidate || ![1, 2, 3, 4, 5, 6, 7].includes(candidate.version)) return candidate;
 
         const migrated = JSON.parse(JSON.stringify(candidate));
         if (migrated.selectedCycleCount === '6' || migrated.selectedCycleCount === '8') {
@@ -385,10 +1150,36 @@
         const sixCycles = migrated.configs && migrated.configs['6'] && migrated.configs['6'].cycles;
         const matchesGeneratedSixCycleDefaults =
             cyclesMatch(sixCycles, LEGACY_SIX_CYCLE_DEFAULTS_UNDERSCORED_0600) ||
-            cyclesMatch(sixCycles, LEGACY_SIX_CYCLE_DEFAULTS_NON_UNDERSCORED_0600);
+            cyclesMatch(sixCycles, LEGACY_SIX_CYCLE_DEFAULTS_NON_UNDERSCORED_0600) ||
+            cyclesMatch(sixCycles, LEGACY_SIX_CYCLE_DEFAULTS_V4);
         if (matchesGeneratedSixCycleDefaults) {
             migrated.configs['6'].cycles = DEFAULT_CYCLE_SETTINGS.configs['6'].cycles.map((cycle) => ({ ...cycle }));
         }
+
+        const eightCycles = migrated.configs && migrated.configs['8'] && migrated.configs['8'].cycles;
+        if (cyclesMatch(eightCycles, LEGACY_EIGHT_CYCLE_DEFAULTS_V4)) {
+            migrated.configs['8'].cycles = DEFAULT_CYCLE_SETTINGS.configs['8'].cycles.map((cycle) => ({ ...cycle }));
+        }
+
+        for (const count of [6, 8]) {
+            const config = migrated.configs && migrated.configs[String(count)];
+            const defaults = DEFAULT_CYCLE_SETTINGS.configs[String(count)].cycles;
+            if (!config || !Array.isArray(config.cycles)) continue;
+            const legacyBlockStarts = LEGACY_BLOCK_STARTS_V6[String(count)];
+            const usesLegacyBlockStarts = candidate.version === 6 &&
+                config.cycles.length === legacyBlockStarts.length &&
+                config.cycles.every((cycle, index) => cycle.blockStart === legacyBlockStarts[index]);
+            config.cycles = config.cycles.map((cycle, index) => ({
+                ...cycle,
+                blockStart: usesLegacyBlockStarts || typeof cycle.blockStart !== 'string'
+                    ? defaults[index]?.blockStart
+                    : cycle.blockStart,
+                finalDispatch: typeof cycle.finalDispatch === 'string'
+                    ? cycle.finalDispatch
+                    : defaults[index]?.finalDispatch
+            }));
+        }
+
         migrated.version = CYCLE_SETTINGS_VERSION;
         return migrated;
     }
@@ -413,10 +1204,14 @@
 
             const names = new Set();
             const cycles = [];
+            let previousBlockStart = -1;
+            let previousFinalDispatch = -1;
             let previousEnd = -1;
             for (let index = 0; index < config.cycles.length; index += 1) {
                 const cycle = config.cycles[index];
                 const name = cycle && typeof cycle.name === 'string' ? cycle.name.trim() : '';
+                const blockStart = cycle && typeof cycle.blockStart === 'string' ? cycle.blockStart.trim() : '';
+                const finalDispatch = cycle && typeof cycle.finalDispatch === 'string' ? cycle.finalDispatch.trim() : '';
                 const endTime = cycle && typeof cycle.endTime === 'string' ? cycle.endTime.trim() : '';
                 if (!name) {
                     return { ok: false, message: `${count} Cycleの${index + 1}行目にCycleNameを入力してください。` };
@@ -424,16 +1219,32 @@
                 if (names.has(name)) {
                     return { ok: false, message: `${count} Cycle内でCycleName「${name}」が重複しています。` };
                 }
+                const blockStartMinutes = timeToMinutes(blockStart);
+                if (blockStartMinutes === null) {
+                    return { ok: false, message: `${count} Cycleの${index + 1}行目のBlock StartをHH:MM形式で入力してください。` };
+                }
+                if (blockStartMinutes <= previousBlockStart) {
+                    return { ok: false, message: `${count} CycleのBlock Startは上から昇順に設定してください。` };
+                }
+                const finalDispatchMinutes = timeToMinutes(finalDispatch);
+                if (finalDispatchMinutes === null) {
+                    return { ok: false, message: `${count} Cycleの${index + 1}行目のFinal DispatchをHH:MM形式で入力してください。` };
+                }
+                if (finalDispatchMinutes <= previousFinalDispatch) {
+                    return { ok: false, message: `${count} CycleのFinal Dispatchは上から昇順に設定してください。` };
+                }
                 const endMinutes = timeToMinutes(endTime);
                 if (endMinutes === null) {
-                    return { ok: false, message: `${count} Cycleの${index + 1}行目の終了時刻をHH:MM形式で入力してください。` };
+                    return { ok: false, message: `${count} Cycleの${index + 1}行目のDelivery Window EndをHH:MM形式で入力してください。` };
                 }
                 if (endMinutes <= previousEnd) {
-                    return { ok: false, message: `${count} Cycleの終了時刻は上から昇順に設定してください。` };
+                    return { ok: false, message: `${count} CycleのDelivery Window Endは上から昇順に設定してください。` };
                 }
                 names.add(name);
+                previousBlockStart = blockStartMinutes;
+                previousFinalDispatch = finalDispatchMinutes;
                 previousEnd = endMinutes;
-                cycles.push({ name, endTime });
+                cycles.push({ name, blockStart, finalDispatch, endTime });
             }
             normalized.configs[String(count)] = { cycles };
         }
@@ -458,23 +1269,19 @@
         return activeCycleSettings.configs[String(activeCycleSettings.selectedCycleCount)].cycles;
     }
 
-    function activeCycleFilters() {
-        const cycles = activeCycles();
-        return cycles.map((cycle, index) => ({
+    function activeCycleDisplaySchedule() {
+        return activeCycles().map((cycle) => ({
             label: cycle.name,
-            min: index === 0 ? 0 : timeToMinutes(cycles[index - 1].endTime),
-            max: index === cycles.length - 1 ? Infinity : timeToMinutes(cycle.endTime)
+            blockStart: cycle.blockStart,
+            finalDispatch: cycle.finalDispatch,
+            endTime: cycle.endTime
         }));
     }
 
-    function activeCycleDisplaySchedule() {
-        return activeCycles().map((cycle) => ({ label: cycle.name, endTime: cycle.endTime }));
-    }
-
-    /** planner-input検索はFinal Dispatch時刻を使うため、保存されたCycle終了時刻から5分戻す */
+    /** Assignment planner-input検索はCycleごとのFinal Dispatch時刻を使う */
     function activePlannerFinalDispatchSchedule() {
         return activeCycles().map((cycle) => {
-            const targetMinutes = (timeToMinutes(cycle.endTime) - 5 + 1440) % 1440;
+            const targetMinutes = timeToMinutes(cycle.finalDispatch);
             return {
                 label: cycle.name,
                 jstHour: Math.floor(targetMinutes / 60),
@@ -508,9 +1315,8 @@
 
     /** 有効なCycle設定の終了時刻に最も近いラベルを返す（±30分以内） */
     function ssdLabelFromJstTime(timeStr) {
-        if (!timeStr) return 'Unknown';
-        const [h, m] = timeStr.split(':').map(Number);
-        const minutes = h * 60 + m;
+        const minutes = parseTimeOfDayToMinutes(timeStr);
+        if (minutes === null) return 'Unknown';
         let best = null;
         let bestDiff = Infinity;
         for (const cycle of activeCycles()) {
@@ -528,13 +1334,30 @@
         return parseInt(match[1]) * 60 + parseInt(match[2]);
     }
 
-    /** 分数から有効なCycle設定のラベルを判定 */
+    /** Block Startの開始境界から有効なCycleを判定。最初の境界より前は前日最終Cycle。 */
     function getSSDLabel(minutes) {
         if (minutes === null) return null;
-        for (const filter of activeCycleFilters()) {
-            if (minutes >= filter.min && minutes < filter.max) return filter.label;
+        const cycles = activeCycles();
+        if (!cycles.length) return null;
+
+        let selected = cycles[cycles.length - 1];
+        for (const cycle of cycles) {
+            const startMinutes = timeToMinutes(cycle.blockStart);
+            if (startMinutes === null || minutes < startMinutes) break;
+            selected = cycle;
         }
-        return null;
+        return selected.name;
+    }
+
+    /** Delivery Window Endは終了境界が一致する最初のCycleを返す */
+    function getSSDLabelForDeliveryEnd(minutes) {
+        if (minutes === null) return null;
+        const cycles = activeCycles();
+        for (const cycle of cycles) {
+            const endMinutes = timeToMinutes(cycle.endTime);
+            if (endMinutes !== null && minutes <= endMinutes) return cycle.name;
+        }
+        return cycles.length ? cycles[cycles.length - 1].name : null;
     }
 
     /** Route Duration / Block Length などの所要時間文字列を分数に変換 */
@@ -1214,7 +2037,7 @@
                 item.row.classList.add(HIGHLIGHT_CLASS);
             }
 
-            // SSDラベルを判定
+            // Live画面のSSDラベルはBlock Startから判定
             let ssdLabel = null;
             if (item.blockStartText) {
                 const blockStartMinutes = parseTimeOfDayToMinutes(item.blockStartText);
@@ -1310,7 +2133,7 @@
         for (const cycle of activeCycleDisplaySchedule()) {
             const option = document.createElement('option');
             option.value = cycle.label;
-            option.textContent = `${cycle.label} (${cycle.endTime})`;
+            option.textContent = `${cycle.label} (Block ${cycle.blockStart} / End ${cycle.endTime})`;
             select.appendChild(option);
         }
 
@@ -1346,7 +2169,7 @@
 
         const panel = document.createElement('div');
         panel.style.cssText =
-            'width:560px;max-width:calc(100vw - 40px);max-height:calc(100vh - 40px);overflow:auto;' +
+            'width:900px;max-width:calc(100vw - 40px);max-height:calc(100vh - 40px);overflow:auto;' +
             'background:#fff;border:1px solid #aaa;border-radius:6px;box-shadow:0 4px 16px rgba(0,0,0,.3);' +
             'padding:16px;font-family:Arial,sans-serif;color:#16191f;';
 
@@ -1384,9 +2207,12 @@
 
         const columnHeader = document.createElement('div');
         columnHeader.style.cssText =
-            'display:grid;grid-template-columns:36px 1fr 140px;gap:8px;margin-bottom:4px;' +
+            'display:grid;grid-template-columns:36px 1fr 130px 130px 170px;gap:8px;margin-bottom:4px;' +
             'font-size:11px;font-weight:bold;color:#555;';
-        for (const text of ['No.', 'CycleName', '終了時刻 (HH:MM)']) {
+        for (const text of [
+            'No.', 'CycleName', 'Block Start (HH:MM)',
+            'Final Dispatch (HH:MM)', 'Delivery Window End (HH:MM)'
+        ]) {
             const span = document.createElement('span');
             span.textContent = text;
             columnHeader.appendChild(span);
@@ -1402,7 +2228,7 @@
             draft.configs[String(count)].cycles.forEach((cycle, index) => {
                 const row = document.createElement('div');
                 row.style.cssText =
-                    'display:grid;grid-template-columns:36px 1fr 140px;gap:8px;align-items:center;margin-bottom:6px;';
+                    'display:grid;grid-template-columns:36px 1fr 130px 130px 170px;gap:8px;align-items:center;margin-bottom:6px;';
                 const number = document.createElement('span');
                 number.textContent = String(index + 1);
                 number.style.cssText = 'font-size:12px;color:#555;text-align:center;';
@@ -1411,17 +2237,33 @@
                 nameInput.value = cycle.name;
                 nameInput.style.cssText =
                     'height:32px;padding:4px 8px;border:1px solid #aaa;border-radius:4px;font-size:13px;box-sizing:border-box;';
-                const timeInput = document.createElement('input');
-                timeInput.type = 'time';
-                timeInput.step = '60';
-                timeInput.value = cycle.endTime;
-                timeInput.style.cssText =
+                const blockStartInput = document.createElement('input');
+                blockStartInput.type = 'time';
+                blockStartInput.step = '60';
+                blockStartInput.value = cycle.blockStart;
+                blockStartInput.style.cssText =
+                    'height:32px;padding:4px 8px;border:1px solid #aaa;border-radius:4px;font-size:13px;box-sizing:border-box;';
+                const finalDispatchInput = document.createElement('input');
+                finalDispatchInput.type = 'time';
+                finalDispatchInput.step = '60';
+                finalDispatchInput.value = cycle.finalDispatch;
+                finalDispatchInput.style.cssText =
+                    'height:32px;padding:4px 8px;border:1px solid #aaa;border-radius:4px;font-size:13px;box-sizing:border-box;';
+                const endTimeInput = document.createElement('input');
+                endTimeInput.type = 'time';
+                endTimeInput.step = '60';
+                endTimeInput.value = cycle.endTime;
+                endTimeInput.style.cssText =
                     'height:32px;padding:4px 8px;border:1px solid #aaa;border-radius:4px;font-size:13px;box-sizing:border-box;';
                 nameInput.addEventListener('input', () => { cycle.name = nameInput.value; });
-                timeInput.addEventListener('input', () => { cycle.endTime = timeInput.value; });
+                blockStartInput.addEventListener('input', () => { cycle.blockStart = blockStartInput.value; });
+                finalDispatchInput.addEventListener('input', () => { cycle.finalDispatch = finalDispatchInput.value; });
+                endTimeInput.addEventListener('input', () => { cycle.endTime = endTimeInput.value; });
                 row.appendChild(number);
                 row.appendChild(nameInput);
-                row.appendChild(timeInput);
+                row.appendChild(blockStartInput);
+                row.appendChild(finalDispatchInput);
+                row.appendChild(endTimeInput);
                 rows.appendChild(row);
             });
         };
@@ -1875,6 +2717,7 @@
                     date: item?.date || '',
                     time: item?.time || '',
                     ssd: item?.ssd || '',
+                    createdAt: item?.createdAt || 0,
                     headers: t.headers,
                     rows: t.rows,
                     count: cnt,
@@ -2128,31 +2971,75 @@
         return rows.length;
     }
 
-    /** SSD Route PlanのCurrent SSD Planned Routesを直接結合してCSV出力 */
-    function exportSsdRouteCsv(anchorPanel) {
+    /** SSD Route PlanをRoute IDごとの最新状態に統合してCSV出力 */
+    function exportSsdRouteCsv(anchorPanel, ssdLabels) {
         const store = readSsdRouteCollect();
+        const entryTimestamp = (entry) =>
+            entry.createdAt || Date.parse(`${entry.date}T${entry.time}:00+09:00`) || 0;
         const entries = Object.keys(store)
             .map((key) => store[key])
-            .sort((a, b) => `${a.date}${a.time}`.localeCompare(`${b.date}${b.time}`));
+            .filter((entry) => entry.date && entry.time)
+            .sort((a, b) => entryTimestamp(a) - entryTimestamp(b));
         if (!entries.length) return 0;
 
         const headers = ['SSD', '日付(JST)', '時刻(JST)'].concat(SSD_ROUTE_CSV_COLUMNS);
-        const rows = [];
+        const statusColIdx = headers.indexOf('Status');
+        const routeIdColIdx = headers.indexOf('Route ID');
+        const routeDurationColIdx = headers.indexOf('Route Duration Without Inbound Stem');
+        const dispatchEndColIdx = headers.indexOf('Dispatch Window End');
+        const deliveryEndColIdx = headers.indexOf('Delivery Window End');
 
+        // 同じRoute IDは、取得した全時間のうち最も新しい状態だけを採用する。
+        const latestByRouteId = new Map();
         for (const entry of entries) {
             const indexes = SSD_ROUTE_CSV_COLUMNS.map((column) =>
                 entry.headers.findIndex((header) => header.trim().toLowerCase() === column.toLowerCase())
             );
+            const timestamp = entryTimestamp(entry);
+
             for (const sourceRow of entry.rows || []) {
-                rows.push([
+                const row = [
                     entry.ssd || '',
                     entry.date || '',
                     entry.time || '',
                     ...indexes.map((index) => (index >= 0 ? sourceRow[index] || '' : ''))
-                ]);
+                ];
+
+                // Delivery Window End = Dispatch Window End + Route Duration Without Inbound Stem。
+                // 直接取得時は未丸めの生秒数で計算済み。画面巡回時だけ表示値から補完する。
+                if (deliveryEndColIdx >= 0) {
+                    if (!row[deliveryEndColIdx] && dispatchEndColIdx >= 0 && routeDurationColIdx >= 0) {
+                        row[deliveryEndColIdx] = calculateDeliveryWindowEnd(
+                            row[dispatchEndColIdx],
+                            row[routeDurationColIdx]
+                        );
+                    }
+
+                    const label = getSSDLabelForDeliveryEnd(
+                        parseTimeOfDayToMinutes(row[deliveryEndColIdx])
+                    );
+                    if (label) row[0] = label;
+                }
+
+                const routeId = routeIdColIdx >= 0 ? (row[routeIdColIdx] || '').trim() : '';
+                if (!routeId) continue;
+
+                latestByRouteId.set(routeId.toLowerCase(), {
+                    row,
+                    date: entry.date,
+                    timestamp,
+                    status: statusColIdx >= 0 ? (row[statusColIdx] || '').trim().toUpperCase() : ''
+                });
             }
         }
 
+        // Route IDで重複排除した最新状態がCOMPLETEDまたはOPENの行をCSVに残す。
+        const rows = Array.from(latestByRouteId.values())
+            .filter((item) =>
+                (!ssdLabels || ssdLabels.includes(item.row[0])) &&
+                (item.status === 'COMPLETED' || item.status === 'OPEN')
+            )
+            .map((item) => item.row);
         if (!rows.length) return 0;
 
         rows.sort((a, b) => {
@@ -2161,7 +3048,12 @@
         });
 
         displaySPR(
-            calculateSPR(rows, headers.indexOf('Packages'), headers.indexOf('Matched Block'), true),
+            calculateSPR(
+                rows,
+                headers.indexOf('Packages'),
+                headers.indexOf('Matched Block'),
+                true
+            ),
             anchorPanel
         );
 
@@ -2200,42 +3092,78 @@
                 const d = Math.abs(a.ms - tg.ms);
                 if (d < bd) { bd = d; best = a; }
             }
+            const jt = best ? jstFromArtifactId(best.id) : { date: dateStr, time: tg.t };
             return {
-                time: tg.t,
+                time: jt.time || tg.t,
+                date: jt.date || dateStr,
+                ssd: ssdLabelFromJstTime(jt.time || tg.t),
                 id: best ? best.id : null,
+                artifactType: INPUT_TYPE,
                 url: best ? `${location.origin}/assignment-plan/${encodeURIComponent(best.id)}` : null
             };
         });
     }
 
-    /** artifact-metadata APIから各SSD時刻に最も近いSSD Route Planを解決 */
-    async function resolveSsdRouteUrls(sa, dateStr, times) {
-        const targets = times
-            .map((t) => ({ t, ms: Date.parse(`${dateStr}T${t}:00+09:00`) }))
-            .filter((x) => !Number.isNaN(x.ms));
-        if (!targets.length) return [];
+    /** 選択日のSSD Route Planを検索する。最終日は最終Cycle終了分までに制限できる。 */
+    async function resolveSsdRouteUrls(sa, dateStr, cutoffTime = null) {
+        const startMs = Date.parse(`${dateStr}T00:00:00+09:00`);
+        if (Number.isNaN(startMs)) return [];
 
-        const startSec = Math.floor(Math.min(...targets.map((x) => x.ms)) / 1000) - 1800;
-        const endSec = Math.floor(Math.max(...targets.map((x) => x.ms)) / 1000) + 1800;
-        const list = await fetchSsdRoutePlanMeta(sa, startSec, endSec);
-        const withMs = list.map((a) => ({ ms: Date.parse(a.creationTime) || 0, id: a.artifactId }));
+        const cutoffMinutes = cutoffTime ? timeToMinutes(cutoffTime) : null;
+        const endMs = cutoffMinutes === null
+            ? startMs + 24 * 3600 * 1000
+            : Math.min(startMs + 24 * 3600 * 1000, startMs + (cutoffMinutes + 1) * 60 * 1000);
+        const list = await fetchSsdRoutePlanMeta(
+            sa,
+            Math.floor(startMs / 1000),
+            Math.floor(endMs / 1000)
+        );
 
-        return targets.map((tg) => {
-            let best = null;
-            let bd = Infinity;
-            for (const a of withMs) {
-                const d = Math.abs(a.ms - tg.ms);
-                if (d < bd) { bd = d; best = a; }
+        const artifacts = list
+            .map((artifact) => {
+                const createdAt = Date.parse(artifact.creationTime) || 0;
+                const idJst = jstFromArtifactId(artifact.artifactId);
+                const createdJst = createdAt ? new Date(createdAt + 9 * 3600 * 1000) : null;
+                const date = idJst.date || (createdJst
+                    ? `${createdJst.getUTCFullYear()}-${p2(createdJst.getUTCMonth() + 1)}-${p2(createdJst.getUTCDate())}`
+                    : '');
+                const time = idJst.time || (createdJst
+                    ? `${p2(createdJst.getUTCHours())}:${p2(createdJst.getUTCMinutes())}`
+                    : '');
+                return {
+                    date,
+                    time,
+                    createdAt,
+                    id: artifact.artifactId,
+                    artifactType: artifact.artifactType,
+                    url: artifact.artifactId
+                        ? `${location.origin}/ssd-route-page/${encodeURIComponent(artifact.artifactId)}`
+                        : null
+                };
+            })
+            .filter((artifact) => {
+                if (!artifact.url || artifact.date !== dateStr || !artifact.time) return false;
+                if (cutoffMinutes === null) return true;
+                const artifactMinutes = parseTimeOfDayToMinutes(artifact.time);
+                return artifactMinutes !== null && artifactMinutes <= cutoffMinutes;
+            });
+
+        // 同じ5分枠に複数Artifactがある場合は、最も新しい1件だけを巡回する。
+        const latestByInterval = new Map();
+        for (const artifact of artifacts) {
+            const minutes = parseTimeOfDayToMinutes(artifact.time);
+            if (minutes === null) continue;
+            const intervalKey = Math.floor(minutes / 5);
+            const current = latestByInterval.get(intervalKey);
+            if (!current || artifact.createdAt >= current.createdAt) {
+                latestByInterval.set(intervalKey, artifact);
             }
-            return {
-                time: tg.t,
-                id: best ? best.id : null,
-                url: best ? `${location.origin}/ssd-route-page/${encodeURIComponent(best.id)}` : null
-            };
-        });
+        }
+
+        return Array.from(latestByInterval.values()).sort((a, b) => a.createdAt - b.createdAt);
     }
 
-    /** 複数日付×SSD時刻を作業タブで巡回し、完了後に結合CSVを出力 */
+    /** 複数日付のデータを5分刻みで選び、作業タブ巡回後に結合CSVを出力 */
     async function runBatchExport(sa, dates, ssdLabels, statusEl) {
         const sourcePanel = statusEl.closest('[data-ufraa-batch-panel]');
         const mode = sourcePanel?.dataset.ufraaBatchPanel === 'SSD Route Plans' ? 'ssdRoute' : 'assignment';
@@ -2246,22 +3174,26 @@
         }
 
         const times = ssdTimesForLabels(ssdLabels);
+        const cycles = activeCycles();
+        const finalCycleEndTime = cycles.length ? cycles[cycles.length - 1].endTime : null;
         let items = [];
 
         for (let i = 0; i < dates.length; i++) {
             if (mode === 'ssdRoute') {
                 statusEl.textContent = `SSD Route Plan検索中... (${i + 1}/${dates.length}日)`;
                 try {
-                    const resolved = await resolveSsdRouteUrls(sa, dates[i], times);
+                    const cutoffTime = i === dates.length - 1 ? finalCycleEndTime : null;
+                    const resolved = await resolveSsdRouteUrls(sa, dates[i], cutoffTime);
                     items = items.concat(
-                        resolved
-                            .filter((result) => result.url)
-                            .map((result) => ({
-                                url: result.url,
-                                date: dates[i],
-                                time: result.time,
-                                ssd: ssdLabelFromJstTime(result.time)
-                            }))
+                        resolved.map((result) => ({
+                            id: result.id,
+                            artifactType: result.artifactType,
+                            url: result.url,
+                            date: result.date,
+                            time: result.time,
+                            createdAt: result.createdAt,
+                            ssd: ssdLabelFromJstTime(result.time)
+                        }))
                     );
                 } catch (e) {
                     console.warn('[Ufraa] SSD Route Plan resolve error for', dates[i], e);
@@ -2271,7 +3203,14 @@
                 try {
                     const resolved = await resolveUrls(sa, dates[i], times);
                     items = items.concat(
-                        resolved.filter((result) => result.url).map((result) => ({ url: result.url }))
+                        resolved.filter((result) => result.url).map((result) => ({
+                            id: result.id,
+                            artifactType: result.artifactType,
+                            url: result.url,
+                            date: result.date,
+                            time: result.time,
+                            ssd: result.ssd
+                        }))
                     );
                 } catch (e) {
                     console.warn('[Ufraa] resolve error for', dates[i], e);
@@ -2287,11 +3226,48 @@
             return;
         }
 
+        if (mode === 'ssdRoute') {
+            writeSsdRouteCollect({});
+            statusEl.textContent = `0 / ${items.length} 直接取得中...`;
+            const directResults = await collectSsdRoutePlansDirect(items, statusEl);
+            const failedItems = items.filter((item, index) => !directResults[index]?.ok);
+
+            if (!failedItems.length) {
+                const collected = readSsdRouteCollect();
+                const rowCount = exportSsdRouteCsv(sourcePanel, ssdLabels);
+                statusEl.textContent = rowCount > 0
+                    ? `✅ 完了！ ${Object.keys(collected).length}時刻 / 計${rowCount}行をCSV保存しました。`
+                    : '⚠️ データを取得できませんでした。';
+                return;
+            }
+
+            console.warn('[Ufraa] 直接取得できなかったArtifactを画面巡回へ切替:', failedItems.length,
+                directResults.filter((result) => !result?.ok).map((result) => result?.error));
+            statusEl.textContent = `直接取得 ${items.length - failedItems.length}件完了 / ${failedItems.length}件を画面取得へ切替...`;
+            items = failedItems;
+        } else {
+            writeCollect({});
+            const directResults = await collectAssignmentPlansDirect(items, statusEl);
+            const failedItems = items.filter((item, index) => !directResults[index]?.ok);
+
+            if (!failedItems.length) {
+                const collected = readCollect();
+                const rowCount = exportCombinedCsv(sourcePanel);
+                statusEl.textContent = rowCount > 0
+                    ? `✅ 完了！ ${Object.keys(collected).length}時刻 / 計${rowCount}行をCSV保存しました。`
+                    : '⚠️ データを取得できませんでした。';
+                return;
+            }
+
+            console.warn('[Ufraa] Assignment Plan直接取得失敗:', failedItems.length,
+                directResults.filter((result) => !result?.ok).map((result) => result?.error));
+            statusEl.textContent = `⚠️ Assignment Planを${failedItems.length}件取得できなかったため、CSVを出力しませんでした。`;
+            return;
+        }
+
         const allUrls = items.map((item) => item.url);
 
-        // 収集ストアをクリアしてキューを設定
-        if (mode === 'ssdRoute') writeSsdRouteCollect({});
-        else writeCollect({});
+        // 直接取得できなかった項目だけ、従来の作業タブ巡回へフォールバックする。
         localStorage.setItem(
             LS_QUEUE,
             JSON.stringify({
@@ -2328,7 +3304,9 @@
             clearInterval(progressInterval);
             const collected = mode === 'ssdRoute' ? readSsdRouteCollect() : readCollect();
             const count = Object.keys(collected).length;
-            const rowCount = mode === 'ssdRoute' ? exportSsdRouteCsv(sourcePanel) : exportCombinedCsv(sourcePanel);
+            const rowCount = mode === 'ssdRoute'
+                ? exportSsdRouteCsv(sourcePanel, ssdLabels)
+                : exportCombinedCsv(sourcePanel);
             statusEl.textContent =
                 rowCount > 0
                     ? `✅ 完了！ ${count}時刻 / 計${rowCount}行をCSV保存しました。`
@@ -2361,7 +3339,7 @@
         if (existingPanel) {
             if (!document.getElementById(cycleSettingsButtonId)) {
                 existingPanel.appendChild(makeCycleSettingsButton(cycleSettingsButtonId));
-                console.log(`[Ufraa v4.3] ${sectionTitle}のCycle設定ボタンを補完`);
+                console.log(`[Ufraa v5.9] ${sectionTitle}のCycle設定ボタンを補完`);
             }
             return;
         }
@@ -2376,11 +3354,6 @@
         panel.id = panelId;
         panel.dataset.ufraaBatchPanel = sectionTitle;
         panel.style.cssText = 'display:flex;align-items:center;gap:8px;margin-left:auto;';
-
-        // 認証状態
-        const authSpan = document.createElement('span');
-        authSpan.id = `ufraa-ssd-auth${idSuffix}`;
-        authSpan.style.cssText = 'font-size:10px;margin-right:4px;';
 
         const mkLabel = (text) => {
             const s = document.createElement('span');
@@ -2400,12 +3373,16 @@
         const dateFromInput = mkDateInput('ufraa-ssd-date-from');
         const dateToInput = mkDateInput('ufraa-ssd-date-to');
 
-        // SSDドロップダウン
-        const select = document.createElement('select');
-        select.id = `ufraa-ssd-select${idSuffix}`;
-        select.dataset.ufraaBatchCycleSelect = 'true';
-        select.style.cssText = 'padding:4px 6px;border:1px solid #aaa;border-radius:4px;font-size:13px;height:32px;';
-        fillCycleSelect(select, true);
+        // Cycle選択はSSD Route Plansだけに表示。Assignment Plansは常に全Cycleを対象にする。
+        const showCycleSelect = sectionTitle === 'SSD Route Plans';
+        let select = null;
+        if (showCycleSelect) {
+            select = document.createElement('select');
+            select.id = `ufraa-ssd-select${idSuffix}`;
+            select.dataset.ufraaBatchCycleSelect = 'true';
+            select.style.cssText = 'padding:4px 6px;border:1px solid #aaa;border-radius:4px;font-size:13px;height:32px;';
+            fillCycleSelect(select, true);
+        }
 
         // 実行ボタン
         const runBtn = document.createElement('button');
@@ -2433,7 +3410,7 @@
             if (!dateFrom || !dateTo) { statusSpan.textContent = '日付を選択してください。'; return; }
             if (dateFrom > dateTo) { statusSpan.textContent = 'From日付がTo日付より後です。'; return; }
 
-            const labels = select.value ? [select.value] : null;
+            const labels = select?.value ? [select.value] : null;
 
             // 日付範囲から全日付リストを生成
             const dates = [];
@@ -2457,28 +3434,18 @@
             }
         });
 
-        panel.appendChild(authSpan);
+        panel.appendChild(statusSpan);
         panel.appendChild(mkLabel('From:'));
         panel.appendChild(dateFromInput);
         panel.appendChild(mkLabel('To:'));
         panel.appendChild(dateToInput);
-        panel.appendChild(select);
+        if (select) panel.appendChild(select);
         panel.appendChild(runBtn);
         panel.appendChild(cycleSettingsBtn);
-        panel.appendChild(statusSpan);
 
         toolsRow.style.display = 'flex';
         toolsRow.style.alignItems = 'center';
         toolsRow.appendChild(panel);
-
-        // 認証状態を定期更新
-        const updateAuth = () => {
-            const ok = AUTH.creds && AUTH.midway;
-            authSpan.textContent = ok ? '✅' : '⏳';
-            authSpan.title = ok ? '認証取得済み' : '認証待ち（リロードで取得）';
-        };
-        updateAuth();
-        setInterval(updateAuth, 1500);
     }
 
     function injectPanel() {
@@ -2536,5 +3503,5 @@
     if (document.readyState !== 'loading') tick();
     document.addEventListener('DOMContentLoaded', tick);
 
-    console.log('[Ufraa v4.3] 起動 (Assignment Plan + SSD Batch CSV)');
+    console.log('[Ufraa v5.9] 起動 (Assignment Plan + SSD Batch CSV)');
 })();
