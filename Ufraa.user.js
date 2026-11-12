@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ufraa
 // @namespace    https://github.com/yuyna-amazon/Ufraa
-// @version      6.0
+// @version      6.2
 // @description  Ufraa Assignment Plan: Route Duration乖離表示 + SSDラベル + CSV出力 / Service AreasからAssignment・SSD Route Planを直接一括取得
 // @author       yuyna
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=amazon.com
@@ -692,7 +692,12 @@
             ];
         }).filter((row) => row[1]);
 
-        if (!rows.length) throw new Error('Route IDを取得できませんでした。');
+        if (!rows.length) {
+            if (routeList.length === 0) {
+                return { headers: SSD_ROUTE_CSV_COLUMNS.slice(), rows: [], count: 0 };
+            }
+            throw new Error('Route IDを取得できませんでした。');
+        }
         if (!rows.some((row) => row[2])) throw new Error('Route Statusを取得できませんでした。');
         return { headers: SSD_ROUTE_CSV_COLUMNS.slice(), rows, count: rows.length };
     }
@@ -2162,9 +2167,6 @@
             selectedSSD = '';
         }
 
-        document.querySelectorAll('[data-ufraa-batch-cycle-select]').forEach((batchSelect) => {
-            fillCycleSelect(batchSelect, true);
-        });
         runGapCheck();
     }
 
@@ -3259,10 +3261,10 @@
                 return;
             }
 
-            console.warn('[Ufraa] 直接取得できなかったArtifactを画面巡回へ切替:', failedItems.length,
+            console.warn('[Ufraa] SSD Route Plan直接取得失敗:', failedItems.length,
                 directResults.filter((result) => !result?.ok).map((result) => result?.error));
-            statusEl.textContent = `直接取得 ${items.length - failedItems.length}件完了 / ${failedItems.length}件を画面取得へ切替...`;
-            items = failedItems;
+            statusEl.textContent = `⚠️ SSD Route Planを${failedItems.length}件取得できなかったため、CSVを出力しませんでした。`;
+            return;
         } else {
             writeCollect({});
             const directResults = await collectAssignmentPlansDirect(items, statusEl);
@@ -3283,54 +3285,6 @@
             return;
         }
 
-        const allUrls = items.map((item) => item.url);
-
-        // 直接取得できなかった項目だけ、従来の作業タブ巡回へフォールバックする。
-        localStorage.setItem(
-            LS_QUEUE,
-            JSON.stringify({
-                urls: allUrls,
-                items,
-                idx: 0,
-                active: true,
-                total: allUrls.length,
-                mode,
-                ts: Date.now()
-            })
-        );
-
-        // 作業タブを開く
-        const w = window.open(allUrls[0], 'ufraaSsdWorker', 'width=800,height=600,left=0,top=0');
-        if (!w) {
-            statusEl.textContent = '⚠️ ポップアップがブロックされました。このサイトのポップアップを許可してください。';
-            return;
-        }
-        window.focus();
-
-        statusEl.textContent = `0 / ${allUrls.length} 取得中...`;
-
-        // メインタブでlocalStorageを監視して進捗表示
-        const progressInterval = setInterval(() => {
-            const q = loadJson(LS_QUEUE);
-            if (!q) { clearInterval(progressInterval); return; }
-
-            if (q.active) {
-                statusEl.textContent = `${q.idx || 0} / ${q.total || allUrls.length} 取得中...`;
-                return;
-            }
-
-            clearInterval(progressInterval);
-            const collected = mode === 'ssdRoute' ? readSsdRouteCollect() : readCollect();
-            const count = Object.keys(collected).length;
-            const rowCount = mode === 'ssdRoute'
-                ? exportSsdRouteCsv(sourcePanel, ssdLabels)
-                : exportCombinedCsv(sourcePanel);
-            statusEl.textContent =
-                rowCount > 0
-                    ? `✅ 完了！ ${count}時刻 / 計${rowCount}行をCSV保存しました。`
-                    : '⚠️ データを取得できませんでした。';
-            localStorage.removeItem(LS_QUEUE);
-        }, 1000);
     }
 
     // ===========================================================
@@ -3357,7 +3311,7 @@
         if (existingPanel) {
             if (!document.getElementById(cycleSettingsButtonId)) {
                 existingPanel.appendChild(makeCycleSettingsButton(cycleSettingsButtonId));
-                console.log(`[Ufraa v5.10] ${sectionTitle}のCycle設定ボタンを補完`);
+                console.log(`[Ufraa v6.2] ${sectionTitle}のCycle設定ボタンを補完`);
             }
             return;
         }
@@ -3391,16 +3345,7 @@
         const dateFromInput = mkDateInput('ufraa-ssd-date-from');
         const dateToInput = mkDateInput('ufraa-ssd-date-to');
 
-        // Cycle選択はSSD Route Plansだけに表示。Assignment Plansは常に全Cycleを対象にする。
-        const showCycleSelect = sectionTitle === 'SSD Route Plans';
-        let select = null;
-        if (showCycleSelect) {
-            select = document.createElement('select');
-            select.id = `ufraa-ssd-select${idSuffix}`;
-            select.dataset.ufraaBatchCycleSelect = 'true';
-            select.style.cssText = 'padding:4px 6px;border:1px solid #aaa;border-radius:4px;font-size:13px;height:32px;';
-            fillCycleSelect(select, true);
-        }
+        // Service Areasのバッチ出力は常に全Cycleを対象にする。
 
         // 実行ボタン
         const runBtn = document.createElement('button');
@@ -3428,7 +3373,7 @@
             if (!dateFrom || !dateTo) { statusSpan.textContent = '日付を選択してください。'; return; }
             if (dateFrom > dateTo) { statusSpan.textContent = 'From日付がTo日付より後です。'; return; }
 
-            const labels = select?.value ? [select.value] : null;
+            const labels = null;
 
             // 日付範囲から全日付リストを生成
             const dates = [];
@@ -3457,7 +3402,6 @@
         panel.appendChild(dateFromInput);
         panel.appendChild(mkLabel('To:'));
         panel.appendChild(dateToInput);
-        if (select) panel.appendChild(select);
         panel.appendChild(runBtn);
         panel.appendChild(cycleSettingsBtn);
 
@@ -3521,5 +3465,5 @@
     if (document.readyState !== 'loading') tick();
     document.addEventListener('DOMContentLoaded', tick);
 
-    console.log('[Ufraa v5.10] 起動 (Assignment Plan + SSD Batch CSV)');
+    console.log('[Ufraa v6.2] 起動 (Assignment Plan + SSD Batch CSV)');
 })();
