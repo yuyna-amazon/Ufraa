@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ufraa
 // @namespace    https://github.com/yuyna-amazon/Ufraa
-// @version      6.7
+// @version      6.8
 // @description  Ufraa Assignment Plan: Route Duration乖離表示 + SSDラベル + CSV出力 / Service AreasからAssignment・SSD Route Planを直接一括取得
 // @author       yuyna
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=amazon.com
@@ -3141,7 +3141,7 @@
     }
 
     /** SSD Route PlanをRoute IDごとの最新状態に統合してCSV出力 */
-    function exportSsdRouteCsv(anchorPanel, ssdLabels, fileName) {
+    function exportSsdRouteCsv(anchorPanel, ssdLabels, fileName, dates) {
         const store = readSsdRouteCollect();
         const entryTimestamp = (entry) =>
             entry.createdAt || Date.parse(`${entry.date}T${entry.time}:00+09:00`) || 0;
@@ -3155,10 +3155,13 @@
         const statusColIdx = headers.indexOf('Status');
         const routeIdColIdx = headers.indexOf('Route ID');
         const routeDurationColIdx = headers.indexOf('Route Duration Without Inbound Stem');
+        const dispatchStartColIdx = headers.indexOf('Dispatch Window Start');
         const dispatchEndColIdx = headers.indexOf('Dispatch Window End');
         const matchedBlockColIdx = headers.indexOf('Matched Block');
         const deliveryEndColIdx = headers.indexOf('Delivery Window End');
         const routeDurationPercentColIdx = headers.indexOf('Route Duration %');
+        const selectedFromDate = normalizeYmd(dates?.[0]);
+        const selectedToDate = normalizeYmd(dates?.length ? dates[dates.length - 1] : '');
 
         // 同じRoute IDは、取得した全時間のうち最も新しい状態だけを採用する。
         const latestByRouteId = new Map();
@@ -3175,6 +3178,12 @@
                     entry.time || '',
                     ...indexes.map((index) => (index >= 0 ? sourceRow[index] || '' : ''))
                 ];
+
+                const dispatchStartDate = dispatchStartColIdx >= 0
+                    ? jstDateFromDateTime(row[dispatchStartColIdx])
+                    : '';
+                if (selectedFromDate && selectedToDate && dispatchStartDate &&
+                    (dispatchStartDate < selectedFromDate || dispatchStartDate > selectedToDate)) continue;
 
                 const baseDate = normalizeYmd(row[1]);
                 const dispatchEndDate = dispatchEndColIdx >= 0
@@ -3432,7 +3441,7 @@
 
             if (!failedItems.length) {
                 const collected = readSsdRouteCollect();
-                const rowCount = exportSsdRouteCsv(sourcePanel, ssdLabels, fileName);
+                const rowCount = exportSsdRouteCsv(sourcePanel, ssdLabels, fileName, dates);
                 statusEl.textContent = rowCount > 0
                     ? `✅ 完了！ ${Object.keys(collected).length}時刻 / 計${rowCount}行をCSV保存しました。`
                     : '⚠️ データを取得できませんでした。';
@@ -3489,7 +3498,7 @@
         if (existingPanel) {
             if (!document.getElementById(cycleSettingsButtonId)) {
                 existingPanel.appendChild(makeCycleSettingsButton(cycleSettingsButtonId));
-                console.log(`[Ufraa v6.7] ${sectionTitle}のCycle設定ボタンを補完`);
+                console.log(`[Ufraa v6.8] ${sectionTitle}のCycle設定ボタンを補完`);
             }
             return;
         }
@@ -3643,5 +3652,5 @@
     if (document.readyState !== 'loading') tick();
     document.addEventListener('DOMContentLoaded', tick);
 
-    console.log('[Ufraa v6.7] 起動 (Assignment Plan + SSD Batch CSV)');
+    console.log('[Ufraa v6.8] 起動 (Assignment Plan + SSD Batch CSV)');
 })();
