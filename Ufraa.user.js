@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ufraa
 // @namespace    https://github.com/yuyna-amazon/Ufraa
-// @version      6.3
+// @version      6.7
 // @description  Ufraa Assignment Plan: Route Duration乖離表示 + SSDラベル + CSV出力 / Service AreasからAssignment・SSD Route Planを直接一括取得
 // @author       yuyna
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=amazon.com
@@ -1333,6 +1333,27 @@
         const d = new Date(Date.now() + 9 * 3600 * 1000);
         return `${d.getUTCFullYear()}${p2(d.getUTCMonth() + 1)}${p2(d.getUTCDate())}_` +
                `${p2(d.getUTCHours())}${p2(d.getUTCMinutes())}${p2(d.getUTCSeconds())}`;
+    }
+
+    function stationCodeFromPage() {
+        for (const element of document.querySelectorAll('div, span')) {
+            const text = (element.textContent || '').trim();
+            const match = /^.+\(([A-Z0-9]+)\)\s*-\s*Amazon\.com$/i.exec(text);
+            if (match) return match[1].toUpperCase();
+        }
+        const fallback = /\(([A-Z0-9]+)\)\s*-\s*Amazon\.com/i.exec(document.body?.innerText || '');
+        return fallback ? fallback[1].toUpperCase() : 'UNKNOWN';
+    }
+
+    function batchExportFileName(mode, dates) {
+        const dateToken = (value) => {
+            const normalized = normalizeYmd(value);
+            return normalized ? normalized.slice(5).replace('-', '') : '0000';
+        };
+        const from = dateToken(dates[0]);
+        const to = dateToken(dates[dates.length - 1]);
+        const title = mode === 'ssdRoute' ? 'SSD Route Plans' : 'Assignment Plans';
+        return `${title}.${from}-${to}.${stationCodeFromPage()}.csv`;
     }
 
     /** artifactIdのパス (/YYYY/MM/DD/HH/mm/) からJSTの日付と時刻を復元 */
@@ -2917,11 +2938,128 @@
         container.innerHTML = html;
     }
 
+    function displayClosureReasonAverages(rows, closureReasonColIdx, routeDurationPercentColIdx, anchorPanel) {
+        if (closureReasonColIdx < 0 || routeDurationPercentColIdx < 0) return;
+
+        const summary = new Map();
+        for (const row of rows) {
+            const reason = String(row[closureReasonColIdx] || '').trim();
+            if (!reason || reason === '-' || reason.toLowerCase() === 'unknown') continue;
+
+            const percent = parseFloat(String(row[routeDurationPercentColIdx] || '').replace('%', ''));
+            if (!Number.isFinite(percent)) continue;
+
+            const current = summary.get(reason) || { sum: 0, count: 0 };
+            current.sum += percent;
+            current.count += 1;
+            summary.set(reason, current);
+        }
+
+        if (!summary.size) return;
+
+        const displayId = anchorPanel?.id ? `${anchorPanel.id}-spr-display` : 'ufraa-spr-display';
+        const container = document.getElementById(displayId);
+        if (!container) return;
+
+        let html = '<div style="font-weight:bold;margin:12px 0 6px;color:#0073bb;">📊 Avg. Route Duration % by Closure Reason</div>';
+        html += '<table style="border-collapse:collapse;width:100%;max-width:620px;font-size:11px;">';
+        html += '<tr style="background:#0073bb;color:#fff;">';
+        html += '<th style="padding:4px 6px;text-align:left">Closure Reason</th>';
+        html += '<th style="padding:4px 6px;text-align:right">Avg. Route Duration %</th>';
+        html += '</tr>';
+
+        for (const [reason, values] of Array.from(summary.entries()).sort(([a], [b]) => a.localeCompare(b))) {
+            const average = (values.sum / values.count).toFixed(1);
+            html += '<tr style="border-bottom:1px solid #ddd;">';
+            html += `<td style="padding:4px 6px;">${escapeHtml(reason)}</td>`;
+            html += `<td style="padding:4px 6px;text-align:right;font-weight:bold;background:#e8f5e9;">${average}%</td>`;
+            html += '</tr>';
+        }
+        html += '</table>';
+
+        container.insertAdjacentHTML('beforeend', html);
+    }
+
+    function displayClosureReasonDetails(rows, timeColIdx, closureReasonColIdx, anchorPanel) {
+        if (timeColIdx < 0 || closureReasonColIdx < 0 || !rows.length) return;
+
+        const hours = new Set();
+        const summary = new Map();
+        for (const row of rows) {
+            const minutes = parseTimeOfDayToMinutes(String(row[timeColIdx] || ''));
+            if (minutes === null) continue;
+
+            const hour = Math.floor(minutes / 60);
+            const rawReason = String(row[closureReasonColIdx] || '').trim();
+            const reason = !rawReason || rawReason === '-' ? 'Unknown' : rawReason;
+            hours.add(hour);
+            if (!summary.has(reason)) summary.set(reason, new Map());
+            const byHour = summary.get(reason);
+            byHour.set(hour, (byHour.get(hour) || 0) + 1);
+        }
+        if (!summary.size) return;
+
+        const sortedHours = Array.from(hours).sort((a, b) => a - b);
+        const sortedReasons = Array.from(summary.keys()).sort((a, b) => {
+            if (a === 'Unknown') return 1;
+            if (b === 'Unknown') return -1;
+            return a.localeCompare(b);
+        });
+        const grandTotal = Array.from(summary.values()).reduce(
+            (total, byHour) => total + Array.from(byHour.values()).reduce((sum, count) => sum + count, 0),
+            0
+        );
+
+        const displayId = anchorPanel?.id ? `${anchorPanel.id}-spr-display` : 'ufraa-spr-display';
+        const container = document.getElementById(displayId);
+        if (!container) return;
+
+        let html = '<div style="font-weight:bold;margin:12px 0 6px;color:#0073bb;">📊 Route Count by Closure Reason &amp; Time</div>';
+        html += '<div style="overflow-x:auto;"><table style="border-collapse:collapse;width:100%;font-size:11px;">';
+        html += '<tr style="background:#0073bb;color:#fff;">';
+        html += '<th style="padding:4px 6px;text-align:left;white-space:nowrap">Closure Reason</th>';
+        for (const hour of sortedHours) {
+            html += `<th style="padding:4px 6px;text-align:right;white-space:nowrap">${hour}時</th>`;
+        }
+        html += '<th style="padding:4px 6px;text-align:right">総数</th>';
+        html += '<th style="padding:4px 6px;text-align:right">%</th>';
+        html += '</tr>';
+
+        const hourTotals = new Map(sortedHours.map((hour) => [hour, 0]));
+        for (const reason of sortedReasons) {
+            const byHour = summary.get(reason);
+            let rowTotal = 0;
+            html += '<tr style="border-bottom:1px solid #ddd;">';
+            html += `<td style="padding:4px 6px;">${escapeHtml(reason)}</td>`;
+            for (const hour of sortedHours) {
+                const count = byHour.get(hour) || 0;
+                rowTotal += count;
+                hourTotals.set(hour, hourTotals.get(hour) + count);
+                html += `<td style="padding:4px 6px;text-align:right">${count || '-'}</td>`;
+            }
+            const percentage = grandTotal > 0 ? ((rowTotal / grandTotal) * 100).toFixed(1) : '0.0';
+            html += `<td style="padding:4px 6px;text-align:right;font-weight:bold;background:#e8f5e9;">${rowTotal}</td>`;
+            html += `<td style="padding:4px 6px;text-align:right;font-weight:bold;background:#e8f5e9;">${percentage}%</td>`;
+            html += '</tr>';
+        }
+
+        html += '<tr style="background:#e8f5e9;font-weight:bold;">';
+        html += '<td style="padding:4px 6px;">総計</td>';
+        for (const hour of sortedHours) {
+            html += `<td style="padding:4px 6px;text-align:right">${hourTotals.get(hour)}</td>`;
+        }
+        html += `<td style="padding:4px 6px;text-align:right">${grandTotal}</td>`;
+        html += '<td style="padding:4px 6px;text-align:right">100.0%</td>';
+        html += '</tr></table></div>';
+
+        container.insertAdjacentHTML('beforeend', html);
+    }
+
     // ===========================================================
     // 10. Batch: 収集データの結合CSV出力
     // ===========================================================
 
-    function exportCombinedCsv(anchorPanel) {
+    function exportCombinedCsv(anchorPanel, fileName) {
         const store = readCollect();
         const entries = Object.keys(store)
             .map((k) => store[k])
@@ -2998,12 +3136,12 @@
         displaySPR(calculateSPR(rows, pkgColIdx, blColIdx), anchorPanel);
 
         const sa = serviceAreaId() || 'sa';
-        downloadText(arrToCsv(headers, rows), `ssd_batch_${sa.slice(0, 8)}_${stampNow()}.csv`);
+        downloadText(arrToCsv(headers, rows), fileName || `ssd_batch_${sa.slice(0, 8)}_${stampNow()}.csv`);
         return rows.length;
     }
 
     /** SSD Route PlanをRoute IDごとの最新状態に統合してCSV出力 */
-    function exportSsdRouteCsv(anchorPanel, ssdLabels) {
+    function exportSsdRouteCsv(anchorPanel, ssdLabels, fileName) {
         const store = readSsdRouteCollect();
         const entryTimestamp = (entry) =>
             entry.createdAt || Date.parse(`${entry.date}T${entry.time}:00+09:00`) || 0;
@@ -3103,9 +3241,21 @@
             ),
             anchorPanel
         );
+        displayClosureReasonAverages(
+            rows,
+            headers.indexOf('Closure Reason'),
+            headers.indexOf('Route Duration %'),
+            anchorPanel
+        );
+        displayClosureReasonDetails(
+            rows,
+            headers.indexOf('時刻(JST)'),
+            headers.indexOf('Closure Reason'),
+            anchorPanel
+        );
 
         const sa = serviceAreaId() || 'sa';
-        downloadText(arrToCsv(headers, rows), `ssd_route_batch_${sa.slice(0, 8)}_${stampNow()}.csv`);
+        downloadText(arrToCsv(headers, rows), fileName || `ssd_route_batch_${sa.slice(0, 8)}_${stampNow()}.csv`);
         return rows.length;
     }
 
@@ -3214,6 +3364,7 @@
     async function runBatchExport(sa, dates, ssdLabels, statusEl) {
         const sourcePanel = statusEl.closest('[data-ufraa-batch-panel]');
         const mode = sourcePanel?.dataset.ufraaBatchPanel === 'SSD Route Plans' ? 'ssdRoute' : 'assignment';
+        const fileName = batchExportFileName(mode, dates);
         console.log('[Ufraa] runBatchExport:', sa, dates, ssdLabels, { mode });
         if (!AUTH.creds || !AUTH.midway) {
             statusEl.textContent = '⏳ 認証が未取得です。ページをリロードしてください。';
@@ -3281,7 +3432,7 @@
 
             if (!failedItems.length) {
                 const collected = readSsdRouteCollect();
-                const rowCount = exportSsdRouteCsv(sourcePanel, ssdLabels);
+                const rowCount = exportSsdRouteCsv(sourcePanel, ssdLabels, fileName);
                 statusEl.textContent = rowCount > 0
                     ? `✅ 完了！ ${Object.keys(collected).length}時刻 / 計${rowCount}行をCSV保存しました。`
                     : '⚠️ データを取得できませんでした。';
@@ -3299,7 +3450,7 @@
 
             if (!failedItems.length) {
                 const collected = readCollect();
-                const rowCount = exportCombinedCsv(sourcePanel);
+                const rowCount = exportCombinedCsv(sourcePanel, fileName);
                 statusEl.textContent = rowCount > 0
                     ? `✅ 完了！ ${Object.keys(collected).length}時刻 / 計${rowCount}行をCSV保存しました。`
                     : '⚠️ データを取得できませんでした。';
@@ -3338,7 +3489,7 @@
         if (existingPanel) {
             if (!document.getElementById(cycleSettingsButtonId)) {
                 existingPanel.appendChild(makeCycleSettingsButton(cycleSettingsButtonId));
-                console.log(`[Ufraa v6.3] ${sectionTitle}のCycle設定ボタンを補完`);
+                console.log(`[Ufraa v6.7] ${sectionTitle}のCycle設定ボタンを補完`);
             }
             return;
         }
@@ -3492,5 +3643,5 @@
     if (document.readyState !== 'loading') tick();
     document.addEventListener('DOMContentLoaded', tick);
 
-    console.log('[Ufraa v6.3] 起動 (Assignment Plan + SSD Batch CSV)');
+    console.log('[Ufraa v6.7] 起動 (Assignment Plan + SSD Batch CSV)');
 })();
