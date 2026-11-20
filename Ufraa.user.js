@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ufraa
 // @namespace    https://github.com/yuyna-amazon/Ufraa
-// @version      6.8
+// @version      7.2
 // @description  Ufraa Assignment Plan: Route Duration乖離表示 + SSDラベル + CSV出力 / Service AreasからAssignment・SSD Route Planを直接一括取得
 // @author       yuyna
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=amazon.com
@@ -27,7 +27,7 @@
     const CHECK_INTERVAL_MS = 5000;
     const TICK_INTERVAL_MS = 500;
 
-    const CYCLE_SETTINGS_VERSION = 8;
+    const CYCLE_SETTINGS_VERSION = 9;
     const LEGACY_SIX_CYCLE_DEFAULTS_UNDERSCORED_0600 = Object.freeze([
         Object.freeze({ name: 'SSD_1',   endTime: '06:00' }),
         Object.freeze({ name: 'SSD_1_B', endTime: '09:00' }),
@@ -72,7 +72,7 @@
         configs: Object.freeze({
             '6': Object.freeze({
                 cycles: Object.freeze([
-                    Object.freeze({ name: 'SSD1',   blockStart: '03:00', finalDispatch: '05:45', endTime: '07:59' }),
+                    Object.freeze({ name: 'SSD1',   blockStart: '00:00', finalDispatch: '05:45', endTime: '07:59' }),
                     Object.freeze({ name: 'SSD1_B', blockStart: '06:00', finalDispatch: '08:45', endTime: '10:59' }),
                     Object.freeze({ name: 'SSD2',   blockStart: '09:00', finalDispatch: '11:45', endTime: '13:59' }),
                     Object.freeze({ name: 'SSD3',   blockStart: '12:00', finalDispatch: '15:45', endTime: '17:59' }),
@@ -1174,7 +1174,7 @@
     }
 
     function migrateCycleSettings(candidate) {
-        if (!candidate || ![1, 2, 3, 4, 5, 6, 7].includes(candidate.version)) return candidate;
+        if (!candidate || ![1, 2, 3, 4, 5, 6, 7, 8].includes(candidate.version)) return candidate;
 
         const migrated = JSON.parse(JSON.stringify(candidate));
         if (migrated.selectedCycleCount === '6' || migrated.selectedCycleCount === '8') {
@@ -1203,9 +1203,15 @@
             const usesLegacyBlockStarts = candidate.version === 6 &&
                 config.cycles.length === legacyBlockStarts.length &&
                 config.cycles.every((cycle, index) => cycle.blockStart === legacyBlockStarts[index]);
+            const usesPreviousDefaultSsd1BlockStart = count === 6 &&
+                config.cycles[0]?.name === 'SSD1' &&
+                config.cycles[0]?.blockStart === '03:00' &&
+                config.cycles[0]?.finalDispatch === '05:45' &&
+                config.cycles[0]?.endTime === '07:59';
             config.cycles = config.cycles.map((cycle, index) => ({
                 ...cycle,
-                blockStart: usesLegacyBlockStarts || typeof cycle.blockStart !== 'string'
+                blockStart: usesLegacyBlockStarts || (usesPreviousDefaultSsd1BlockStart && index === 0) ||
+                    typeof cycle.blockStart !== 'string'
                     ? defaults[index]?.blockStart
                     : cycle.blockStart,
                 finalDispatch: typeof cycle.finalDispatch === 'string'
@@ -2796,12 +2802,14 @@
     // 9. Batch: SPR集計と表示
     // ===========================================================
 
-    const BLOCK_LENGTHS = ['5h', '4.5h', '4h', '3.5h', '3h', '2.5h', '2h', '1.5h'];
+    const BLOCK_LENGTHS = ['6h', '5.5h', '5h', '4.5h', '4h', '3.5h', '3h', '2.5h', '2h', '1.5h'];
 
     /** 分数からBlock Lengthラベルに変換（±15分の幅で判定） */
     function minutesToBlockLabel(minutes) {
         if (minutes === null) return null;
         const labels = [
+            { label: '6h',   min: 345 }, // 5h45m以上 → 6h
+            { label: '5.5h', min: 315 }, // 5h15m以上 → 5.5h
             { label: '5h',   min: 285 }, // 4h45m以上 → 5h
             { label: '4.5h', min: 255 }, // 4h15m以上 → 4.5h
             { label: '4h',   min: 225 }, // 3h45m以上 → 4h
@@ -2938,44 +2946,86 @@
         container.innerHTML = html;
     }
 
-    function displayClosureReasonAverages(rows, closureReasonColIdx, routeDurationPercentColIdx, anchorPanel) {
-        if (closureReasonColIdx < 0 || routeDurationPercentColIdx < 0) return;
+    function displayClosureReasonAverages(rows, closureReasonColIdx, cycleColIdx, routeDurationPercentColIdx, anchorPanel) {
+        if (routeDurationPercentColIdx < 0) return;
 
-        const summary = new Map();
+        const closureSummary = new Map();
+        const cycleSummary = new Map();
         for (const row of rows) {
-            const reason = String(row[closureReasonColIdx] || '').trim();
-            if (!reason || reason === '-' || reason.toLowerCase() === 'unknown') continue;
-
             const percent = parseFloat(String(row[routeDurationPercentColIdx] || '').replace('%', ''));
             if (!Number.isFinite(percent)) continue;
 
-            const current = summary.get(reason) || { sum: 0, count: 0 };
-            current.sum += percent;
-            current.count += 1;
-            summary.set(reason, current);
+            if (closureReasonColIdx >= 0) {
+                const reason = String(row[closureReasonColIdx] || '').trim();
+                if (reason && reason !== '-' && reason.toLowerCase() !== 'unknown') {
+                    const current = closureSummary.get(reason) || { sum: 0, count: 0 };
+                    current.sum += percent;
+                    current.count += 1;
+                    closureSummary.set(reason, current);
+                }
+            }
+
+            if (cycleColIdx >= 0) {
+                const cycle = String(row[cycleColIdx] || '').trim();
+                if (cycle && cycle !== '-' && cycle.toLowerCase() !== 'unknown') {
+                    const current = cycleSummary.get(cycle) || { sum: 0, count: 0 };
+                    current.sum += percent;
+                    current.count += 1;
+                    cycleSummary.set(cycle, current);
+                }
+            }
         }
 
-        if (!summary.size) return;
+        if (!closureSummary.size && !cycleSummary.size) return;
 
         const displayId = anchorPanel?.id ? `${anchorPanel.id}-spr-display` : 'ufraa-spr-display';
         const container = document.getElementById(displayId);
         if (!container) return;
 
-        let html = '<div style="font-weight:bold;margin:12px 0 6px;color:#0073bb;">📊 Avg. Route Duration % by Closure Reason</div>';
-        html += '<table style="border-collapse:collapse;width:100%;max-width:620px;font-size:11px;">';
-        html += '<tr style="background:#0073bb;color:#fff;">';
-        html += '<th style="padding:4px 6px;text-align:left">Closure Reason</th>';
-        html += '<th style="padding:4px 6px;text-align:right">Avg. Route Duration %</th>';
-        html += '</tr>';
+        const renderAverageTable = (title, label, valueLabel, entries) => {
+            let tableHtml = '<div style="flex:1 1 360px;max-width:620px;">';
+            tableHtml += `<div style="font-weight:bold;margin:12px 0 6px;color:#0073bb;">📊 ${title}</div>`;
+            tableHtml += '<table style="border-collapse:collapse;width:100%;font-size:11px;">';
+            tableHtml += '<tr style="background:#0073bb;color:#fff;">';
+            tableHtml += `<th style="padding:4px 6px;text-align:left">${label}</th>`;
+            tableHtml += `<th style="padding:4px 6px;text-align:right">${valueLabel}</th>`;
+            tableHtml += '</tr>';
+            for (const [name, values] of entries) {
+                const average = (values.sum / values.count).toFixed(1);
+                tableHtml += '<tr style="border-bottom:1px solid #ddd;">';
+                tableHtml += `<td style="padding:4px 6px;">${escapeHtml(name)}</td>`;
+                tableHtml += `<td style="padding:4px 6px;text-align:right;font-weight:bold;background:#e8f5e9;">${average}%</td>`;
+                tableHtml += '</tr>';
+            }
+            tableHtml += '</table></div>';
+            return tableHtml;
+        };
 
-        for (const [reason, values] of Array.from(summary.entries()).sort(([a], [b]) => a.localeCompare(b))) {
-            const average = (values.sum / values.count).toFixed(1);
-            html += '<tr style="border-bottom:1px solid #ddd;">';
-            html += `<td style="padding:4px 6px;">${escapeHtml(reason)}</td>`;
-            html += `<td style="padding:4px 6px;text-align:right;font-weight:bold;background:#e8f5e9;">${average}%</td>`;
-            html += '</tr>';
+        let html = '<div style="display:flex;gap:24px;align-items:flex-start;flex-wrap:wrap;">';
+        if (closureSummary.size) {
+            const entries = Array.from(closureSummary.entries()).sort(([a], [b]) => a.localeCompare(b));
+            html += renderAverageTable(
+                'Avg. Route Duration % by Closure Reason',
+                'Closure Reason',
+                'Closure Reason',
+                entries
+            );
         }
-        html += '</table>';
+        if (cycleSummary.size) {
+            const cycleOrder = new Map(activeCycles().map((cycle, index) => [cycle.name, index]));
+            const entries = Array.from(cycleSummary.entries()).sort(([a], [b]) => {
+                const aOrder = cycleOrder.has(a) ? cycleOrder.get(a) : Number.MAX_SAFE_INTEGER;
+                const bOrder = cycleOrder.has(b) ? cycleOrder.get(b) : Number.MAX_SAFE_INTEGER;
+                return aOrder - bOrder || a.localeCompare(b);
+            });
+            html += renderAverageTable(
+                'Avg. Route Duration % by Cycle',
+                'Cycle',
+                'Avg. Route Duration %',
+                entries
+            );
+        }
+        html += '</div>';
 
         container.insertAdjacentHTML('beforeend', html);
     }
@@ -3119,13 +3169,27 @@
             return i >= 0 ? i + offset : -1;
         };
         const blockStartColIdx = findCol('block start');
+        const dispatchStartColIdx = findCol('dispatch start');
+        const dispatchEndColIdx = findCol('dispatch end');
         const pkgColIdx = findCol('route package count');
         const blColIdx = findCol('block length');
 
-        // SSD列をBlock Startの時刻から再判定（planner-input生成時刻ではなく実際の枠で分類する）
+        // 通常はBlock Startで分類し、Dispatchが日付をまたぐ場合は終了時刻のCycleに分類する。
         if (blockStartColIdx >= 0) {
             rows.forEach((row) => {
-                const label = getSSDLabel(parseTimeOfDayToMinutes((row[blockStartColIdx] || '').trim()));
+                let label = null;
+                if (dispatchStartColIdx >= 0 && dispatchEndColIdx >= 0) {
+                    const dispatchStartDate = jstDateFromDateTime(row[dispatchStartColIdx]);
+                    const dispatchEndDate = jstDateFromDateTime(row[dispatchEndColIdx]);
+                    if (dispatchStartDate && dispatchEndDate && dispatchStartDate < dispatchEndDate) {
+                        label = getSSDLabelForDeliveryEnd(
+                            parseTimeOfDayToMinutes((row[dispatchEndColIdx] || '').trim())
+                        );
+                    }
+                }
+                if (!label) {
+                    label = getSSDLabel(parseTimeOfDayToMinutes((row[blockStartColIdx] || '').trim()));
+                }
                 if (label) row[0] = label;
             });
 
@@ -3253,6 +3317,7 @@
         displayClosureReasonAverages(
             rows,
             headers.indexOf('Closure Reason'),
+            headers.indexOf('SSD'),
             headers.indexOf('Route Duration %'),
             anchorPanel
         );
