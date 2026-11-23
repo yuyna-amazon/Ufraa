@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ufraa
 // @namespace    https://github.com/yuyna-amazon/Ufraa
-// @version      7.2
+// @version      7.5
 // @description  Ufraa Assignment Plan: Route Duration乖離表示 + SSDラベル + CSV出力 / Service AreasからAssignment・SSD Route Planを直接一括取得
 // @author       yuyna
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=amazon.com
@@ -2982,7 +2982,7 @@
         const container = document.getElementById(displayId);
         if (!container) return;
 
-        const renderAverageTable = (title, label, valueLabel, entries) => {
+        const renderAverageTable = (title, label, valueLabel, entries, clickableRows = false) => {
             let tableHtml = '<div style="flex:1 1 360px;max-width:620px;">';
             tableHtml += `<div style="font-weight:bold;margin:12px 0 6px;color:#0073bb;">📊 ${title}</div>`;
             tableHtml += '<table style="border-collapse:collapse;width:100%;font-size:11px;">';
@@ -2993,7 +2993,14 @@
             for (const [name, values] of entries) {
                 const average = (values.sum / values.count).toFixed(1);
                 tableHtml += '<tr style="border-bottom:1px solid #ddd;">';
-                tableHtml += `<td style="padding:4px 6px;">${escapeHtml(name)}</td>`;
+                if (clickableRows) {
+                    tableHtml += '<td style="padding:4px 6px;">';
+                    tableHtml += `<button type="button" data-ufraa-cycle="${escapeHtml(name)}" aria-pressed="false" `;
+                    tableHtml += 'style="padding:0;border:0;background:transparent;color:#0073bb;font:inherit;font-weight:bold;text-decoration:underline;cursor:pointer;">';
+                    tableHtml += `${escapeHtml(name)}</button></td>`;
+                } else {
+                    tableHtml += `<td style="padding:4px 6px;">${escapeHtml(name)}</td>`;
+                }
                 tableHtml += `<td style="padding:4px 6px;text-align:right;font-weight:bold;background:#e8f5e9;">${average}%</td>`;
                 tableHtml += '</tr>';
             }
@@ -3022,12 +3029,180 @@
                 'Avg. Route Duration % by Cycle',
                 'Cycle',
                 'Avg. Route Duration %',
-                entries
+                entries,
+                true
             );
         }
         html += '</div>';
 
         container.insertAdjacentHTML('beforeend', html);
+    }
+
+    function displayRouteDurationDiagnostics(rows, headers, anchorPanel) {
+        const columnIndex = (name) => headers.indexOf(name);
+        const indices = {
+            cycle: columnIndex('SSD'),
+            routeCode: columnIndex('Route Code'),
+            routeId: columnIndex('Route ID'),
+            status: columnIndex('Status'),
+            routeTags: columnIndex('Route Tags'),
+            packages: columnIndex('Packages'),
+            routeDuration: columnIndex('Route Duration Without Inbound Stem'),
+            matchedBlock: columnIndex('Matched Block'),
+            deliveryWindowEnd: columnIndex('Delivery Window End'),
+            closureReason: columnIndex('Closure Reason'),
+            percent: columnIndex('Route Duration %')
+        };
+        if (indices.cycle < 0 || indices.percent < 0) return;
+
+        const cellValue = (row, index) => index >= 0 ? String(row[index] || '').trim() : '';
+        const routes = [];
+        for (const row of rows) {
+            const percentText = cellValue(row, indices.percent);
+            if (!percentText) continue;
+            const percent = parseFloat(percentText.replace('%', ''));
+            if (!Number.isFinite(percent)) continue;
+
+            const rawReason = cellValue(row, indices.closureReason);
+            routes.push({
+                percent,
+                reason: !rawReason || rawReason === '-' ? 'Unknown' : rawReason,
+                cycle: cellValue(row, indices.cycle),
+                routeCode: cellValue(row, indices.routeCode),
+                routeId: cellValue(row, indices.routeId),
+                status: cellValue(row, indices.status),
+                routeTags: cellValue(row, indices.routeTags),
+                packages: cellValue(row, indices.packages),
+                routeDuration: cellValue(row, indices.routeDuration),
+                matchedBlock: cellValue(row, indices.matchedBlock),
+                deliveryWindowEnd: cellValue(row, indices.deliveryWindowEnd)
+            });
+        }
+        if (!routes.length) return;
+
+        routes.sort((a, b) =>
+            a.percent - b.percent ||
+            a.reason.localeCompare(b.reason) ||
+            a.routeCode.localeCompare(b.routeCode)
+        );
+
+        const displayId = anchorPanel?.id ? `${anchorPanel.id}-spr-display` : 'ufraa-spr-display';
+        const container = document.getElementById(displayId);
+        if (!container) return;
+
+        const openCycleModal = (selectedCycle) => {
+            const cycleRoutes = routes.filter((route) => route.cycle === selectedCycle);
+            const byReason = new Map();
+            for (const route of cycleRoutes) {
+                const current = byReason.get(route.reason) || {
+                    count: 0,
+                    sum: 0,
+                    min: Number.POSITIVE_INFINITY
+                };
+                current.count += 1;
+                current.sum += route.percent;
+                current.min = Math.min(current.min, route.percent);
+                byReason.set(route.reason, current);
+            }
+            const reasonEntries = Array.from(byReason.entries()).sort(([, a], [, b]) =>
+                (a.sum / a.count) - (b.sum / b.count)
+            );
+
+            let contentHtml = `<div style="margin-bottom:8px;color:#555;font-size:11px;">${cycleRoutes.length} RouteをDuration %が低い順に全件表示（空白は除外）</div>`;
+            if (!cycleRoutes.length) {
+                contentHtml += '<div style="color:#555;font-size:11px;">表示できるRoute Duration %がありません。</div>';
+            } else {
+                contentHtml += '<div style="display:flex;gap:24px;align-items:flex-start;flex-wrap:wrap;margin-bottom:12px;">';
+                contentHtml += '<table style="border-collapse:collapse;min-width:460px;font-size:11px;">';
+                contentHtml += '<tr style="background:#0073bb;color:#fff;">';
+                contentHtml += '<th style="padding:4px 6px;text-align:left">Closure Reason</th>';
+                contentHtml += '<th style="padding:4px 6px;text-align:right">Routes</th>';
+                contentHtml += '<th style="padding:4px 6px;text-align:right">Avg.</th>';
+                contentHtml += '<th style="padding:4px 6px;text-align:right">Min.</th>';
+                contentHtml += '</tr>';
+                for (const [reason, values] of reasonEntries) {
+                    contentHtml += '<tr style="border-bottom:1px solid #ddd;">';
+                    contentHtml += `<td style="padding:4px 6px;">${escapeHtml(reason)}</td>`;
+                    contentHtml += `<td style="padding:4px 6px;text-align:right;">${values.count}</td>`;
+                    contentHtml += `<td style="padding:4px 6px;text-align:right;font-weight:bold;background:#fff3e0;">${(values.sum / values.count).toFixed(1)}%</td>`;
+                    contentHtml += `<td style="padding:4px 6px;text-align:right;font-weight:bold;background:#ffebee;">${values.min.toFixed(1)}%</td>`;
+                    contentHtml += '</tr>';
+                }
+                contentHtml += '</table></div>';
+
+                contentHtml += '<div style="overflow-x:auto;"><table style="border-collapse:collapse;width:100%;font-size:11px;">';
+                contentHtml += '<tr style="background:#0073bb;color:#fff;">';
+                for (const heading of [
+                    'Route Duration %', 'Closure Reason', 'Cycle', 'Route Code', 'Route ID', 'Status',
+                    'Route Tags', 'Packages', 'Route Duration', 'Matched Block', 'Delivery Window End'
+                ]) {
+                    contentHtml += `<th style="padding:4px 6px;text-align:left;white-space:nowrap;position:sticky;top:0;z-index:1;background:#0073bb;">${heading}</th>`;
+                }
+                contentHtml += '</tr>';
+                for (const route of cycleRoutes) {
+                    contentHtml += '<tr style="border-bottom:1px solid #ddd;">';
+                    contentHtml += `<td style="padding:4px 6px;text-align:right;font-weight:bold;background:#fff3e0;white-space:nowrap;">${route.percent.toFixed(1)}%</td>`;
+                    contentHtml += `<td style="padding:4px 6px;white-space:nowrap;">${escapeHtml(route.reason)}</td>`;
+                    contentHtml += `<td style="padding:4px 6px;white-space:nowrap;">${escapeHtml(route.cycle)}</td>`;
+                    contentHtml += `<td style="padding:4px 6px;white-space:nowrap;">${escapeHtml(route.routeCode)}</td>`;
+                    contentHtml += `<td style="padding:4px 6px;white-space:nowrap;">${escapeHtml(route.routeId)}</td>`;
+                    contentHtml += `<td style="padding:4px 6px;white-space:nowrap;">${escapeHtml(route.status)}</td>`;
+                    contentHtml += `<td style="padding:4px 6px;white-space:nowrap;">${escapeHtml(route.routeTags)}</td>`;
+                    contentHtml += `<td style="padding:4px 6px;text-align:right;white-space:nowrap;">${escapeHtml(route.packages)}</td>`;
+                    contentHtml += `<td style="padding:4px 6px;white-space:nowrap;">${escapeHtml(route.routeDuration)}</td>`;
+                    contentHtml += `<td style="padding:4px 6px;white-space:nowrap;">${escapeHtml(route.matchedBlock)}</td>`;
+                    contentHtml += `<td style="padding:4px 6px;white-space:nowrap;">${escapeHtml(route.deliveryWindowEnd)}</td>`;
+                    contentHtml += '</tr>';
+                }
+                contentHtml += '</table></div>';
+            }
+
+            document.getElementById('ufraa-route-duration-modal')?.remove();
+            const overlay = document.createElement('div');
+            overlay.id = 'ufraa-route-duration-modal';
+            overlay.style.cssText =
+                'position:fixed;inset:0;z-index:2147483647;display:flex;align-items:center;justify-content:center;' +
+                'padding:24px;background:rgba(0,0,0,.45);box-sizing:border-box;';
+            overlay.innerHTML =
+                '<div role="dialog" aria-modal="true" aria-labelledby="ufraa-route-duration-modal-title" ' +
+                'style="width:min(1500px,96vw);max-height:92vh;overflow:auto;background:#f0f7ff;border:1px solid #0073bb;' +
+                'border-radius:8px;box-shadow:0 12px 36px rgba(0,0,0,.35);font-size:12px;">' +
+                '<div style="position:sticky;top:0;z-index:3;display:flex;align-items:center;justify-content:space-between;' +
+                'padding:10px 14px;background:#fff;border-bottom:1px solid #ddd;">' +
+                `<div id="ufraa-route-duration-modal-title" style="font-weight:bold;color:#0073bb;">📊 Route Duration % Diagnostics: ${escapeHtml(selectedCycle)}</div>` +
+                '<button type="button" data-ufraa-modal-close aria-label="閉じる" ' +
+                'style="border:0;background:transparent;font-size:24px;line-height:1;cursor:pointer;color:#555;">×</button>' +
+                '</div>' +
+                `<div style="padding:12px 14px;">${contentHtml}</div>` +
+                '</div>';
+            document.documentElement.appendChild(overlay);
+
+            let onKeyDown;
+            const closeModal = () => {
+                overlay.remove();
+                document.removeEventListener('keydown', onKeyDown);
+            };
+            onKeyDown = (event) => {
+                if (event.key === 'Escape') closeModal();
+            };
+            overlay.addEventListener('click', (event) => {
+                if (event.target === overlay || event.target.closest('[data-ufraa-modal-close]')) closeModal();
+            });
+            document.addEventListener('keydown', onKeyDown);
+            overlay.querySelector('[data-ufraa-modal-close]')?.focus();
+        };
+
+        const cycleButtons = container.querySelectorAll('button[data-ufraa-cycle]');
+        cycleButtons.forEach((button) => {
+            button.addEventListener('click', () => {
+                cycleButtons.forEach((otherButton) => {
+                    const selected = otherButton === button;
+                    otherButton.setAttribute('aria-pressed', selected ? 'true' : 'false');
+                    otherButton.style.color = selected ? '#d13212' : '#0073bb';
+                });
+                openCycleModal(button.dataset.ufraaCycle || '');
+            });
+        });
     }
 
     function displayClosureReasonDetails(rows, timeColIdx, closureReasonColIdx, anchorPanel) {
@@ -3321,6 +3496,7 @@
             headers.indexOf('Route Duration %'),
             anchorPanel
         );
+        displayRouteDurationDiagnostics(rows, headers, anchorPanel);
         displayClosureReasonDetails(
             rows,
             headers.indexOf('時刻(JST)'),
