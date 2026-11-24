@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ufraa
 // @namespace    https://github.com/yuyna-amazon/Ufraa
-// @version      7.5
+// @version      7.8
 // @description  Ufraa Assignment Plan: Route Duration乖離表示 + SSDラベル + CSV出力 / Service AreasからAssignment・SSD Route Planを直接一括取得
 // @author       yuyna
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=amazon.com
@@ -125,6 +125,16 @@
         'Dispatch Window Start',
         'Dispatch Window End',
         'Matched Block',
+        'Matched Block Transporter Type',
+        'Matched Block Start Time',
+        'Matched Block Duration',
+        'Matched Block Usable Duration',
+        'Matched Block Fill Percent',
+        'Matched Block Block Type',
+        'Matched Block Match Result',
+        'Matched Block Ineligible Reason',
+        'Matched Block Service Type ID',
+        'Matched Block Company ID',
         'Delivery Window End',
         'Closure Reason',
         'Route Duration %'
@@ -663,6 +673,66 @@
             .join(', ');
     }
 
+    function formatMatchedBlockPercent(value) {
+        if (value === null || value === undefined || value === '') return '';
+        const text = String(value).trim();
+        if (!text) return '';
+        if (text.includes('%')) return text;
+        const number = Number(text);
+        if (!Number.isFinite(number)) return text;
+        const percent = Math.abs(number) <= 1 ? number * 100 : number;
+        return `${Math.round(percent * 10) / 10}%`;
+    }
+
+    function matchedBlockDetails(route, flat) {
+        const block = route.matchedBlock || route.blockMatch || route.block || route.matchedBlockDetails;
+        const blockFlat = block && typeof block === 'object' ? flattenObject(block) : {};
+        const read = (aliases) => {
+            const blockValue = flatValue(blockFlat, aliases);
+            if (blockValue !== null && blockValue !== undefined) return blockValue;
+            const scopedAliases = aliases.flatMap((alias) => [
+                `matchedBlock.${alias}`,
+                `blockMatch.${alias}`,
+                `block.${alias}`,
+                `matchedBlockDetails.${alias}`
+            ]);
+            return flatValue(flat, scopedAliases);
+        };
+
+        return {
+            transporterType: formatListValue(read([
+                'blockGroup.transporterType', 'transporterType', 'transportationType', 'transportType'
+            ])),
+            startTime: formatDateTimeValue(read([
+                'startTime', 'blockStartTime', 'startDateTime', 'blockStart'
+            ])),
+            duration: formatDurationValue(read([
+                'duration', 'blockDuration', 'length', 'blockLength'
+            ])),
+            usableDuration: formatDurationValue(read([
+                'usableDuration', 'usableBlockDuration'
+            ])),
+            blockFillPercent: formatMatchedBlockPercent(read([
+                'blockFillPercent', 'fillPercent', 'blockFillPercentage', 'fillPercentage', 'blockFill'
+            ])),
+            blockType: formatListValue(read([
+                'blockType', 'type'
+            ])),
+            matchResult: formatListValue(read([
+                'matchResult', 'result', 'eligibilityResult', 'matchStatus'
+            ])),
+            ineligibleReason: formatListValue(read([
+                'ineligibleReason', 'ineligibilityReason'
+            ])),
+            serviceTypeId: formatListValue(read([
+                'serviceTypeId', 'serviceTypeID', 'serviceType.id'
+            ])),
+            companyId: formatListValue(read([
+                'companyId', 'companyID', 'providerId'
+            ]))
+        };
+    }
+
     /** SSD Route Plan Artifactを既存CSV用のテーブル形式へ変換 */
     function parseSsdRouteArtifact(artifact) {
         let routeList = Array.isArray(artifact?.matchEligibleRoutes) ? artifact.matchEligibleRoutes : null;
@@ -687,6 +757,7 @@
                 'dispatchWindowEnd', 'dispatchWindow.endTime', 'dispatchWindow.end', 'dispatchEnd'
             ]);
             const deliveryWindowEnd = calculateDeliveryWindowEnd(dispatchWindowEnd, routeDuration);
+            const blockDetails = matchedBlockDetails(route, flat);
             return [
                 formatListValue(flatValue(flat, ['routeCode', 'routeName'])),
                 formatListValue(flatValue(flat, ['sortGroupId', 'routeId', 'correlationId'])),
@@ -703,6 +774,16 @@
                 ])),
                 formatDateTimeValue(dispatchWindowEnd),
                 matchedBlockText(route, flat),
+                blockDetails.transporterType,
+                blockDetails.startTime,
+                blockDetails.duration,
+                blockDetails.usableDuration,
+                blockDetails.blockFillPercent,
+                blockDetails.blockType,
+                blockDetails.matchResult,
+                blockDetails.ineligibleReason,
+                blockDetails.serviceTypeId,
+                blockDetails.companyId,
                 deliveryWindowEnd,
                 formatListValue(flatValue(flat, ['closureReason', 'routeClosureReason'])),
                 formatRouteDurationPercent(routeDuration, matchedBlockDuration)
@@ -3394,7 +3475,7 @@
         const statusColIdx = headers.indexOf('Status');
         const routeIdColIdx = headers.indexOf('Route ID');
         const routeDurationColIdx = headers.indexOf('Route Duration Without Inbound Stem');
-        const dispatchStartColIdx = headers.indexOf('Dispatch Window Start');
+        const routePromiseTimeColIdx = headers.indexOf('Route Promise Time');
         const dispatchEndColIdx = headers.indexOf('Dispatch Window End');
         const matchedBlockColIdx = headers.indexOf('Matched Block');
         const deliveryEndColIdx = headers.indexOf('Delivery Window End');
@@ -3418,17 +3499,9 @@
                     ...indexes.map((index) => (index >= 0 ? sourceRow[index] || '' : ''))
                 ];
 
-                const dispatchStartDate = dispatchStartColIdx >= 0
-                    ? jstDateFromDateTime(row[dispatchStartColIdx])
+                const routePromiseDate = routePromiseTimeColIdx >= 0
+                    ? jstDateFromDateTime(row[routePromiseTimeColIdx])
                     : '';
-                if (selectedFromDate && selectedToDate && dispatchStartDate &&
-                    (dispatchStartDate < selectedFromDate || dispatchStartDate > selectedToDate)) continue;
-
-                const baseDate = normalizeYmd(row[1]);
-                const dispatchEndDate = dispatchEndColIdx >= 0
-                    ? jstDateFromDateTime(row[dispatchEndColIdx])
-                    : '';
-                if (baseDate && dispatchEndDate && dispatchEndDate > baseDate) continue;
 
                 // Delivery Window End = Dispatch Window End + Route Duration Without Inbound Stem。
                 // 直接取得時は未丸めの生秒数で計算済み。画面巡回時だけ表示値から補完する。
@@ -3461,14 +3534,18 @@
                     row,
                     date: entry.date,
                     timestamp,
+                    routePromiseDate,
                     status: statusColIdx >= 0 ? (row[statusColIdx] || '').trim().toUpperCase() : ''
                 });
             }
         }
 
-        // Route IDで重複排除した最新状態がCOMPLETEDまたはOPENの行をCSVに残す。
+        // Route IDごとの最新状態から、Route Promise Timeが選択日内のCOMPLETEDまたはOPENを残す。
         const rows = Array.from(latestByRouteId.values())
             .filter((item) =>
+                item.routePromiseDate &&
+                (!selectedFromDate || item.routePromiseDate >= selectedFromDate) &&
+                (!selectedToDate || item.routePromiseDate <= selectedToDate) &&
                 (!ssdLabels || ssdLabels.includes(item.row[0])) &&
                 (item.status === 'COMPLETED' || item.status === 'OPEN')
             )
@@ -3886,12 +3963,12 @@
         }
         if (serviceAreaId()) injectPanel();
         if (artifactIdFromPath()) collectAssignmentPage();
-        if (ssdRoutePlanIdFromPath()) collectSsdRoutePage();
+        // SSD Route PlanはArtifactを直接取得するため、単体ページでは旧巡回処理を動かさない。
     }
 
     setInterval(tick, TICK_INTERVAL_MS);
     if (document.readyState !== 'loading') tick();
     document.addEventListener('DOMContentLoaded', tick);
 
-    console.log('[Ufraa v6.8] 起動 (Assignment Plan + SSD Batch CSV)');
+    console.log('[Ufraa v7.8] 起動 (Assignment Plan + SSD Batch CSV)');
 })();
