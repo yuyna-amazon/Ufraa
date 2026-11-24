@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ufraa
 // @namespace    https://github.com/yuyna-amazon/Ufraa
-// @version      7.8
+// @version      7.9
 // @description  Ufraa Assignment Plan: Route Duration乖離表示 + SSDラベル + CSV出力 / Service AreasからAssignment・SSD Route Planを直接一括取得
 // @author       yuyna
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=amazon.com
@@ -169,6 +169,17 @@
     const LS_SSD_ROUTE_COLLECT = 'ufraaSsdRouteCollected';
     const LS_QUEUE = 'ufraaSsdWorkerQueue';
     const LS_CYCLE_SETTINGS = 'ufraaCycleSettings_v1';
+    const LS_SSD_ROUTE_INTERVAL = 'ufraaSsdRouteIntervalMinutes';
+
+    function loadSsdRouteIntervalMinutes() {
+        try {
+            return Number(localStorage.getItem(LS_SSD_ROUTE_INTERVAL)) === 1 ? 1 : 5;
+        } catch (e) {
+            return 5;
+        }
+    }
+
+    let ssdRouteIntervalMinutes = loadSsdRouteIntervalMinutes();
 
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     const p2 = (n) => String(n).padStart(2, '0');
@@ -2315,7 +2326,7 @@
         const header = document.createElement('div');
         header.style.cssText = 'display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;';
         const title = document.createElement('strong');
-        title.textContent = 'Cycle設定';
+        title.textContent = 'UFRAA設定';
         title.style.fontSize = '16px';
         const closeBtn = document.createElement('button');
         closeBtn.type = 'button';
@@ -2343,6 +2354,24 @@
         modeSelect.value = String(draft.selectedCycleCount);
         modeRow.appendChild(modeText);
         modeRow.appendChild(modeSelect);
+
+        const intervalRow = document.createElement('label');
+        intervalRow.style.cssText = 'display:flex;align-items:center;gap:8px;font-size:13px;margin-bottom:12px;';
+        const intervalText = document.createElement('span');
+        intervalText.textContent = 'SSD Route Plan取得間隔';
+        intervalText.style.fontWeight = 'bold';
+        const intervalSelect = document.createElement('select');
+        intervalSelect.style.cssText =
+            'height:32px;padding:4px 8px;border:1px solid #aaa;border-radius:4px;font-size:13px;';
+        for (const minutes of [5, 1]) {
+            const option = document.createElement('option');
+            option.value = String(minutes);
+            option.textContent = `${minutes}分毎`;
+            intervalSelect.appendChild(option);
+        }
+        intervalSelect.value = String(ssdRouteIntervalMinutes);
+        intervalRow.appendChild(intervalText);
+        intervalRow.appendChild(intervalSelect);
 
         const columnHeader = document.createElement('div');
         columnHeader.style.cssText =
@@ -2442,17 +2471,20 @@
             }
             try {
                 localStorage.setItem(LS_CYCLE_SETTINGS, JSON.stringify(result.settings));
+                localStorage.setItem(LS_SSD_ROUTE_INTERVAL, intervalSelect.value);
             } catch (e) {
                 error.textContent = '設定を保存できませんでした。ブラウザの保存領域を確認してください。';
                 return;
             }
             activeCycleSettings = result.settings;
+            ssdRouteIntervalMinutes = Number(intervalSelect.value) === 1 ? 1 : 5;
             close();
             refreshCycleOptions();
         });
 
         panel.appendChild(header);
         panel.appendChild(modeRow);
+        panel.appendChild(intervalRow);
         panel.appendChild(columnHeader);
         panel.appendChild(rows);
         panel.appendChild(error);
@@ -2467,8 +2499,8 @@
         btn.id = id;
         btn.type = 'button';
         btn.textContent = '⚙';
-        btn.title = 'Cycle設定';
-        btn.setAttribute('aria-label', 'Cycle設定');
+        btn.title = 'UFRAA設定';
+        btn.setAttribute('aria-label', 'UFRAA設定');
         btn.style.cssText =
             'padding:0 10px;background:#f2f3f3;color:#687078;border:1px solid #aab7b8;border-radius:4px;cursor:pointer;' +
             'font-size:18px;font-weight:bold;height:32px;line-height:30px;';
@@ -3130,6 +3162,7 @@
             packages: columnIndex('Packages'),
             routeDuration: columnIndex('Route Duration Without Inbound Stem'),
             matchedBlock: columnIndex('Matched Block'),
+            matchedBlockStartTime: columnIndex('Matched Block Start Time'),
             deliveryWindowEnd: columnIndex('Delivery Window End'),
             closureReason: columnIndex('Closure Reason'),
             percent: columnIndex('Route Duration %')
@@ -3156,6 +3189,7 @@
                 packages: cellValue(row, indices.packages),
                 routeDuration: cellValue(row, indices.routeDuration),
                 matchedBlock: cellValue(row, indices.matchedBlock),
+                matchedBlockStartTime: cellValue(row, indices.matchedBlockStartTime),
                 deliveryWindowEnd: cellValue(row, indices.deliveryWindowEnd)
             });
         }
@@ -3215,7 +3249,8 @@
                 contentHtml += '<tr style="background:#0073bb;color:#fff;">';
                 for (const heading of [
                     'Route Duration %', 'Closure Reason', 'Cycle', 'Route Code', 'Route ID', 'Status',
-                    'Route Tags', 'Packages', 'Route Duration', 'Matched Block', 'Delivery Window End'
+                    'Route Tags', 'Packages', 'Route Duration', 'Matched Block', 'Matched Block Start Time',
+                    'Delivery Window End'
                 ]) {
                     contentHtml += `<th style="padding:4px 6px;text-align:left;white-space:nowrap;position:sticky;top:0;z-index:1;background:#0073bb;">${heading}</th>`;
                 }
@@ -3232,6 +3267,7 @@
                     contentHtml += `<td style="padding:4px 6px;text-align:right;white-space:nowrap;">${escapeHtml(route.packages)}</td>`;
                     contentHtml += `<td style="padding:4px 6px;white-space:nowrap;">${escapeHtml(route.routeDuration)}</td>`;
                     contentHtml += `<td style="padding:4px 6px;white-space:nowrap;">${escapeHtml(route.matchedBlock)}</td>`;
+                    contentHtml += `<td style="padding:4px 6px;white-space:nowrap;">${escapeHtml(route.matchedBlockStartTime)}</td>`;
                     contentHtml += `<td style="padding:4px 6px;white-space:nowrap;">${escapeHtml(route.deliveryWindowEnd)}</td>`;
                     contentHtml += '</tr>';
                 }
@@ -3672,12 +3708,12 @@
                 return artifactMinutes !== null && artifactMinutes <= cutoffMinutes;
             });
 
-        // 同じ5分枠に複数Artifactがある場合は、最も新しい1件だけを巡回する。
+        // 設定した取得間隔ごとに、複数Artifactがある場合は最も新しい1件だけを使用する。
         const latestByInterval = new Map();
         for (const artifact of artifacts) {
             const minutes = parseTimeOfDayToMinutes(artifact.time);
             if (minutes === null) continue;
-            const intervalKey = Math.floor(minutes / 5);
+            const intervalKey = Math.floor(minutes / ssdRouteIntervalMinutes);
             const current = latestByInterval.get(intervalKey);
             if (!current || artifact.createdAt >= current.createdAt) {
                 latestByInterval.set(intervalKey, artifact);
@@ -3687,7 +3723,7 @@
         return Array.from(latestByInterval.values()).sort((a, b) => a.createdAt - b.createdAt);
     }
 
-    /** 複数日付のデータを5分刻みで選び、作業タブ巡回後に結合CSVを出力 */
+    /** 複数日付のデータを設定した間隔で選び、結合CSVを出力 */
     async function runBatchExport(sa, dates, ssdLabels, statusEl) {
         const sourcePanel = statusEl.closest('[data-ufraa-batch-panel]');
         const mode = sourcePanel?.dataset.ufraaBatchPanel === 'SSD Route Plans' ? 'ssdRoute' : 'assignment';
@@ -3970,5 +4006,5 @@
     if (document.readyState !== 'loading') tick();
     document.addEventListener('DOMContentLoaded', tick);
 
-    console.log('[Ufraa v7.8] 起動 (Assignment Plan + SSD Batch CSV)');
+    console.log('[Ufraa v7.9] 起動 (Assignment Plan + SSD Batch CSV)');
 })();
